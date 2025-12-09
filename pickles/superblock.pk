@@ -1,0 +1,101 @@
+fun set_little_endian = void: {
+    set_endian(ENDIAN_LITTLE);
+};
+
+/* All metadata fields are stored in little-endian byte order */
+set_little_endian();
+
+/* Superblock version 3 status_flags: only bits 0, 1 and 2 can be set */
+var BITS_3_TO_7 = 0xf8UB;
+
+/* Adopted from codex AI pickle */
+fun h5_bytes_to_u64_le = (byte[] raw) uint<64>:
+{
+  var v = 0 as uint<64>;
+  var shift = 0 as uint<64>;
+
+  for (b in raw) {
+      v = v | ((b as uint<64>) <<. (shift * 8));
+      shift = shift + 1;
+  }
+
+  return v;
+}
+
+/* Adopted from codex AI pickle */
+fun h5_bytes_to_off = (byte[] raw) offset<uint<64>,B>:
+{
+  return h5_bytes_to_u64_le (raw) #B;
+}
+
+
+/* The HDF5 superblock */
+type superblock =
+    struct {
+        byte[8] signature == [0x89UB, 'H', 'D', 'F', '\r', '\n', 0x1aUB, '\n'];
+        byte super_vers: super_vers < 4;
+
+        union  {
+
+            struct {
+                uint<8>  fs_info_vers == 0;     /* Version # of file's free space storage */
+                uint<8>  root_stab_vers == 0;   /* Version # of root group symbol table entry */
+                byte     res1 == 0;             /* Reserved */
+                uint<8>  shared_hdr_vers == 0;  /* Version # of shared header message format */
+                uint<8>  sizeof_offsets;        /* Size of offsets */
+                uint<8>  sizeof_lengths;        /* Size of lengths */
+                byte     res2 == 0;             /* Reserved */
+                uint<16> stab_leaf_k: stab_leaf_k > 0;            /* Group leaf node K */
+                uint<16> stab_internal_k: stab_internal_k > 0;    /* Group internal node K */
+                uint<32> status_flags;          /* File consistency flags */
+
+                /* The following two fields for super_vers == 1 only */
+                /* Indexed storage internal node K */
+                uint<16> indexed_internal_k: indexed_internal_k > 0 if super_vers == 1;
+                uint<16> res3: res3 == 0 if super_vers == 1;    /* Reserved */
+
+                byte[sizeof_offsets] base_addr_raw;      /* Base address */
+                byte[sizeof_offsets] fs_info_addr_raw;   /* Address of file free space info */
+                byte[sizeof_offsets] eof_addr_raw;       /* End of file address */
+                byte[sizeof_offsets] drv_info_addr_raw;  /* Driver information block address */
+
+                /* Root group symbol table entry */
+                struct {
+                    byte[sizeof_offsets] lnk_nm_off_raw;    /* Link name offset */
+                    byte[sizeof_offsets] ohdr_addr_raw;     /* Object header address */
+                    uint<32> cache_type: cache_type < 3;    /* Cache type */
+                    uint<32> res == 0;                      /* Reserved */
+                    union {
+                        struct {
+                            byte[sizeof_offsets] btree_addr_raw; /* Address of stab btree */
+                            byte[sizeof_offsets] heap_addr_raw;  /* Address of stab name heap */
+                        }  stab: cache_type == 1;                /* Group object header metadata */
+
+                        uint<32> slink: cache_type == 2;    /* Symbolic link */
+                        byte[16] pad: cache_type > 2;       /* Scratch-pad space */
+                    } scratch_pad;
+                } root_stab_ent;
+
+            } v0_v1: super_vers < 2;
+    
+            struct {
+                uint<8> sizeof_offsets;
+                uint<8> sizeof_lengths;
+
+                /* File consistency flags */
+                union {
+                    byte v2_flags: super_vers == 2;
+                    byte v3_flags: super_vers == 3 && ((v3_flags & BITS_3_TO_7) == 0);
+                } status_flags;
+
+                byte[sizeof_offsets] base_addr_raw;  /* Base address */
+                byte[sizeof_offsets] ext_addr_raw;   /* Superblock extension address */
+                byte[sizeof_offsets] eof_addr_raw;   /* End of file address */
+                byte[sizeof_offsets] root_obj_raw;   /* Root group object header address */
+                uint<32> chksum;                    /* Superblock checksum */
+
+            } v2_v3: super_vers > 1 && super_vers < 4;
+
+        } super;
+
+    };
