@@ -13,13 +13,13 @@ Development will be based on format specification version 3
 Pickles developed for the specification will be pushed to the
 repository https://github.com/HDFGroup/hdf5-pickles/.  
 
-The following primitives are identified and will be tackled in the following order:
+The following primitives are identified and will be tackled in the following order. Each pickle needs to be verified for correctness with an HDF5 file containing the respective messages.
 1. Superblock: there are 4 versions of the superblock
 2. Object header: it is composed of a prefix and a set of messages:
     * There are two versions of the object header prefixes—version 1 and version 2
     * There is a total of 24 object header messages:
-        *The Bogus Message is excluded as it is used for testing the HDF5 Library’s response to an “unknown” message type and should never be encountered in a valid HDF5 file.
-	*There is the Metadata Cache Image Message which is implemented in the library but has not been documented.
+        * The Bogus Message is excluded as it is used for testing the HDF5 Library’s response to an “unknown” message type and should never be encountered in a valid HDF5 file.
+	    * There is the Metadata Cache Image Message which is implemented in the library but has not been documented.
     * I will divide the messages into two sets. The first set I will tackle is:
         1. Nil Message
         2. Dataspace Message
@@ -46,7 +46,6 @@ The following primitives are identified and will be tackled in the following ord
         1. Object Header Continuation message
         2. Attribute message
         3. Datatype message
-    * Each pickle needs to be verified for correctness with an HDF5 file containing the respective messages.
 
 Then the remaining primitives will be handled as below:
 1. Version 1 and 2 B-trees
@@ -63,7 +62,6 @@ I anticipate work for the following areas:
 * Resolve discrepancies between coding and the format specification that are noted during development
 * Add Metadata Cache Message to the format specification
 * Incorporate info for handling shared messages that are implemented in the library
-* 
 ~
 ~
 ~
