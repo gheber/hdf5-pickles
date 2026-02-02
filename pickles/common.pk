@@ -1,0 +1,542 @@
+fun set_little_endian = void: {
+    set_endian(ENDIAN_LITTLE);
+};
+
+/* All metadata fields are stored in little-endian byte order */
+set_little_endian();
+
+var global_sizeof_offsets = 0 as uint<8>;
+var global_sizeof_lengths = 0 as uint<8>;
+
+fun set_global_sizeof_offsets = (uint<8> sz) int: 
+{
+    global_sizeof_offsets = sz;
+    return 1;
+};
+
+fun set_global_sizeof_lengths = (uint<8> sz) int: 
+{
+    global_sizeof_lengths = sz;
+    return 1;
+};
+
+/* Adopted from codex AI pickle */
+fun h5_bytes_to_u64_le = (byte[] raw) uint<64>:
+{
+    var v = 0 as uint<64>;
+    var shift = 0 as uint<64>;
+
+    for (b in raw) {
+        v = v | ((b as uint<64>) <<. (shift * 8));
+        shift = shift + 1;
+    }
+
+    return v;
+}
+
+/* Adopted from codex AI pickle */
+fun h5_bytes_to_off = (byte[] raw) offset<uint<64>,B>:
+{
+    return h5_bytes_to_u64_le (raw) #B;
+}
+
+fun h5_print_char_array = (char[] data) void:
+{
+    for (c in data) {
+        /* Use %c to print the individual character */
+        printf ("%c", c);
+    }
+    printf("\n");
+}
+
+/*
+ * Messages
+ */
+
+/* H5O_NULL_ID        0x0000 Null Message.  */
+type H5O_msg_null =
+    struct {
+    };
+
+/* H5O_SDSPACE_ID     0x0001 Dataspace Message. */
+type H5O_msg_sdspace =
+    struct {
+        byte version if version < 3;
+        union {
+            struct {
+                byte ndims;
+                byte flags;
+                byte[5] res;
+                byte[global_sizeof_lengths] [ndims] dim_size;
+                byte[global_sizeof_lengths] max if (flags & 1U) != 0;
+                byte[global_sizeof_lengths] perm if (flags & 2U) != 0; /* not implemented in library */
+            } v1: version == 1;
+
+            struct {
+                byte ndims;
+                byte flags;
+                byte space_type;
+                byte[global_sizeof_lengths] dim_size;
+                byte[global_sizeof_lengths] max if (flags & 1U) != 0;
+            } v2: version == 2;
+
+        } space;
+    };
+
+/* H5O_LINFO_ID       0x0002 Link info Message. */
+type H5O_msg_linfo = 
+    struct { 
+        byte version;  
+        byte flags;
+        uint<64> max_corder if (flags & 1U) != 0;    /* Maximum creation index */
+
+        /* Address of fractal heap for storing "dense" links */
+        byte[global_sizeof_offsets] fheap_addr_raw;         
+
+        /* Address of v2 btree for indexing names of links */
+        byte[global_sizeof_offsets] name_bt2_addr_raw;      
+
+        /* Address of v2 btree for indexing creation order values of links */
+        byte[global_sizeof_offsets] corder_bt2_addr_raw if (flags & 2U) != 0;    
+    };
+
+
+
+/* H5O_DTYPE_ID       0x0003 Datatype Message.  */
+
+
+/* H5O_FILL_ID        0x0004 Fill Value Message. (Old)  */
+type H5O_msg_old_fill = 
+    struct {
+        uint<32> fill_size;
+        if (fill_size > 0)
+            byte[fill_size] fill_value;
+    };
+
+
+/* H5O_FILL_NEW_ID    0x0005 Fill Value Message. (New)  */
+type H5O_msg_fill = 
+    struct {
+        byte version: version < 4;
+        union {
+            struct {
+                byte alloc_time;
+                byte fill_time;
+                byte fill_defined;
+                uint<32> fill_size if (fill_defined > 0);
+                if (fill_size > 0)
+                    byte[fill_size] fill_value;
+            } v1_v2: version < 3;
+
+            struct {
+                byte flags;
+                uint<32> fill_size if (flags & 0x020U);
+                if ((flags & 0x020U) && (fill_size > 0))
+                    byte[fill_size] fill_value;
+            } v3: version == 3;
+
+        } space;
+    };
+
+/* H5O_LINK_ID        0x0006 Link Message. */
+var LNK_TYPE_SOFT = 1;   /* Soft link */
+var LNK_TYPE_EXT = 64;   /* External link */
+type H5O_msg_link = 
+    struct { 
+        byte version;  
+        byte flags;
+        var _lnk_type = (flags & 8U);
+        byte lnk_type if (_lnk_type != 0);         /* bit 3 of flags */
+
+        uint<64> corder if (flags & 4U) != 0;   /* Bit 2 of flags */
+        byte cset if (flags & 16U) != 0;        /* Bit 4 of flags */
+
+        var _lnk_len_num_bytes = 1 <<. (flags & 3U);
+        byte[_lnk_len_num_bytes] lnk_len;
+
+        var _lnk_len = h5_bytes_to_u64_le(lnk_len);
+        char[_lnk_len] lnk_name;    /* non-null terminated */
+
+        /* Hard-link: Address of the object header for the link points to */
+        byte[global_sizeof_offsets] ohdr_addr_raw if (_lnk_type == 0);
+
+        /* Soft link */
+        uint<16> soft_len if (_lnk_type == LNK_TYPE_SOFT);
+        if (_lnk_type == 1 && soft_len > 0)
+            char[soft_len] soft_name; /* non-null terminated */
+
+        /* External/user-defined link */
+        uint<16> ud_len if (_lnk_type >= LNK_TYPE_EXT);
+        if (_lnk_type >= 64 && ud_len > 0)  
+            char[ud_len] ud_data; /* external link: string is null terminated */
+    };
+
+
+/* H5O_EFL_ID         0x0007 External File List Message  */
+
+
+
+/* H5O_LAYOUT_ID      0x0008 Data Layout Message.  */
+
+var COMPACT = 0;   /* Compact storage */
+var CONTIG = 1;    /* Contiguous storage */
+var CHUNKED = 2;   /* Chunked storage */
+var VIRTUAL = 3;   /* Virtual storage */
+type H5O_msg_layout =
+    struct {
+        byte version: version < 5;
+        union {
+            struct {
+                byte ndims;
+                byte layout_class;
+                byte[5] res;
+
+                union {
+                    struct {
+                        byte[global_sizeof_offsets] data_addr_raw;
+                        uint<32> [ndims] dim_size;
+                    } contig: layout_class == CONTIG;
+
+                    struct {
+                        byte[global_sizeof_offsets] idx_addr_raw;
+                        uint<32> [ndims] dim_size;
+                    } chunked: layout_class == CHUNKED;
+
+                    struct {
+                        uint<32> [ndims] dim_size;
+                        uint<32> size;
+                        if (size > 0)
+                            byte[size] compact_data;
+                    } compact: layout_class == COMPACT;
+
+                } properties;
+
+            } v1_v2: version < 3;
+
+            struct {
+                byte layout_class;
+                union {
+                    struct {
+                        uint<16> size;
+                        if (size > 0)
+                            byte[size] raw_data;
+                    } compact: layout_class == COMPACT;
+
+                    struct {
+                        byte[global_sizeof_offsets] data_addr_raw;
+                        byte[global_sizeof_lengths] data_size_raw;      
+                    } contig: layout_class == CONTIG;
+
+                    struct {
+                        byte ndims;
+                        byte[global_sizeof_offsets] idx_addr_raw;      
+                        uint<32> [ndims] dim_size;
+                    } chunked: layout_class == CHUNKED;
+                } properties;
+
+            } v3: version == 3;
+
+            struct {
+                byte layout_class;
+                union {
+                    struct {
+                        uint<16> size;
+                        if (size > 0)
+                            byte[size] raw_data;
+
+                        /* Custom Pretty Printer: not printing raw_data if too big */
+                        method _print = void:
+                        {
+                            printf("struct {");
+                            if (size > 100U)
+                                printf ("<size=%u16d, raw_data=NOT PRINTED>", size);
+                            else
+                                printf ("<size=%u16d, raw_data=%v>", size, raw_data);
+                            printf("}");
+                        }
+                    } compact: layout_class == COMPACT;
+
+                    struct {
+                        byte[global_sizeof_offsets] data_addr_raw;      
+                        byte[global_sizeof_lengths] data_size_raw;      
+                    } contig: layout_class == CONTIG;
+
+                    struct {
+                        byte flags;
+                        byte ndims;
+                        byte enc_bytes_per_dim;
+                        byte[enc_bytes_per_dim] [ndims] dim_size;
+                        byte idx_type;
+                        union {
+                            struct {
+                                if (flags & 2U) 
+                                    byte[global_sizeof_lengths] filter_chunk_size;
+                                if (flags & 2U) 
+                                    uint<32> filter_mask;
+                            } single: idx_type == 1;
+
+                            struct {
+                            } implicit: idx_type == 2;
+
+                            struct {
+                                uint<8> max_dblk_page_nelmts_bits;
+                            } farray: idx_type == 3;
+
+                            struct {
+                                uint<8> max_nelmts_bits;
+                                uint<8> idx_blk_elmts;
+                                uint<8> sup_blk_min_data_ptrs;
+                                uint<8> data_blk_min_elmts;
+                                uint<8> max_dblk_page_nelmts_bits; /* ERROR coding: just 1 byte whereas spec 2 bytes */
+                            } earray: idx_type == 4;
+                            struct {
+                                uint<32> node_size;
+                                uint<8> split_percent;
+                                uint<8> merge_percent;
+                            } bt2: idx_type == 5;
+                        } idx_info;
+
+                        byte[global_sizeof_offsets] idx_addr_raw;      
+                    } chunked: layout_class == CHUNKED;
+
+                    struct {
+                        byte[global_sizeof_offsets] gheap_addr_raw;      
+                        uint<32> idx;
+                    } virtual: layout_class == VIRTUAL;
+
+                } properties;
+            } v4: version == 4;
+
+        } layout;
+    };
+
+
+
+/* H5O_BOGUS_VALID_ID 0x0009 "Bogus valid" Message.  */
+/* This message is used for testing the HDF5 Library’s response to an “unknown” message type and 
+   should never be encountered in a valid HDF5 file.
+
+
+/* H5O_GINFO_ID       0x000a Group info Message.  */
+type H5O_msg_ginfo =
+    struct {
+        byte version;
+        byte flags;
+        uint<16> max_compact if (flags & 1U) != 0;      /* Maximum number of links to store “compactly” */
+        uint<16> min_dense if (flags & 1U) != 0;        /* Minimum number of links to store “densely” */
+        uint<16> est_num_entries if (flags & 2U) != 0;  /* Estimated # of entries in group   */
+        uint<16> est_name_len if (flags & 2U) != 0;     /* Estimated length of entry name    */
+    };
+
+
+/* H5O_PLINE_ID       0x000b Filter pipeline message.  */
+type H5O_msg_pline =
+    struct {
+        byte version;
+        byte nfilters;
+        union {
+            struct { 
+                byte[6] res;
+
+                type filt_descr = 
+                    struct  {
+                        uint<16> id;
+                        uint<16> name_len;
+                        uint<16> flags;
+                        uint<16> cd_nelmts;
+                        if (name_len != 0)
+                            char[name_len] name;
+                        uint<32>[cd_nelmts] cd_data;
+                        byte[4] padding if (cd_nelmts % 2) != 0; 
+                    };
+
+                filt_descr[nfilters] filt_list;
+
+            } v1: version == 1;
+            
+            struct {
+                type filt_descr =
+                    struct {
+                        uint<16> id;
+                        uint<16> name_len;
+                        uint<16> flags;
+                        uint<16> cd_nelmts;
+                        if (name_len != 0)
+                            char[name_len] name;
+                        uint<32>[cd_nelmts] cd_data;
+                    };
+                filt_descr[nfilters] filt_list;
+
+            } v2: version == 2;
+    
+        } pline;
+    };
+
+
+
+/* H5O_ATTR_ID        0x000c Attribute Message.  */
+
+
+/* H5O_NAME_ID        0x000d Object name message.  */
+type H5O_msg_name =
+    struct {
+        string name;
+    };
+
+
+
+/* H5O_MTIME_ID       0x000e Modification time message. (Old)  */
+type H5O_msg_old_mtime =
+    struct {
+        int<32> year;
+        int<16> month;
+        int<16> mday;
+        int<16> hour;
+        int<16> minute;
+        int<16> second;
+        byte[2] res;
+    };
+
+
+
+
+/* H5O_SHMESG_ID      0x000f Shared message "SOHM" table. */
+
+
+/* H5O_CONT_ID        0x0010 Object header continuation message.  */
+type H5O_msg_cont =
+    struct {
+        byte[global_sizeof_offsets] addr_raw; /* Address of the header continuation block */
+        byte[global_sizeof_lengths] size_raw;  /* Size of the header continuation block */
+    };
+
+
+
+/* H5O_STAB_ID        0x0011 Symbol table message.  */
+type H5O_msg_stab =
+    struct {
+        byte[global_sizeof_offsets] btree_addr_raw; /* v1 B-tree address */
+        byte[global_sizeof_offsets] heap_addr_raw;  /* Local heap address */
+    };
+
+
+
+/* H5O_MTIME_NEW_ID   0x0012 Modification time message. (New)  */
+type H5O_msg_mtime =
+    struct {
+        byte version;
+        byte[3] res;
+        uint<32> seconds;
+    };
+
+
+/* H5O_BTREEK_ID      0x0013 v1 B-tree 'K' values message.  */
+type H5O_msg_btreek =
+    struct {
+        byte version;
+        uint<16> btree_k_chunk; /* Internal node 'K' value of an indexed storage v1 B-tree */
+        uint<16> btree_k_snode; /* Internal node 'K' value of a group v1 B-tree */
+        uint<16> sym_leaf_k;    /* Leaf node's 'K' value of a group (symbol table) v1 B-tree */
+    };
+
+/* H5O_DRVINFO_ID     0x0014 Driver info message.  */
+type H5O_msg_drvinfo =
+    struct {
+        byte version;
+        char[8] name;               /* Driver name: wn eight-byte ASCII string without null termination */
+        uint<16> info_len;          /* Size in bytes of info_buf */
+        byte[info_len] info_buf;    /* Buffer for storing driver information */
+    };
+
+
+/* H5O_AINFO_ID       0x0015 Attribute info message.  */
+type H5O_msg_ainfo =
+    struct {
+        byte version;
+        byte flags;     /* Attribute index information flag */
+
+        /* Maximum creation order index value for the attributes on the object */
+        uint<16> max_crt_idx if (flags & 1U) != 0;  
+
+        /* Address of fractal heap to store "dense" attributes */
+        byte[global_sizeof_offsets] fheap_addr_raw;  
+
+        /* Address of v2 B-tree to index names of "dense" attributs */
+        byte[global_sizeof_offsets] name_bt2_addr_raw; 
+
+        /* Address of v2 B-tree to index the creation order of "dense" attributes */
+        byte[global_sizeof_offsets] corder_bt2_addr_raw if (flags & 2U) != 0;
+    };
+
+
+
+/* H5O_REFCOUNT_ID    0x0016 Reference count message.  */
+
+
+
+/* H5O_FSINFO_ID      0x0017 File space info message.  */
+var FS_ALLOC_TYPES =  6;
+type H5O_msg_fsinfo =
+    struct {
+        byte version if version < 2;    /* version 0 and 1 are the same */
+        byte strategy;
+        byte persist;
+        byte[global_sizeof_lengths] threshold;  
+        byte[global_sizeof_lengths] page_size;      /* Error in spec */
+        uint<16> pgend_meta_thres;
+        byte[global_sizeof_offsets] eoa;  
+        byte[global_sizeof_offsets][FS_ALLOC_TYPES] small_fs_addr;
+        byte[global_sizeof_offsets][FS_ALLOC_TYPES] large_fs_addr;
+    
+    };
+
+
+/* H5O_MDCI_MSG_ID    0x0018 Metadata Cache Image Message */
+type H5O_msg_mdci=
+    struct {
+        byte version if version == 0;
+        byte[global_sizeof_offsets] image_addr_raw;
+        byte[global_sizeof_lengths] image_size;  
+    };
+
+/* Need to think about on how to handle unknown message or do i need to ? */
+/* H5O_UNKNOWN_ID     0x0019 Placeholder message ID for unknown message.  */
+
+
+
+/*
+ *
+ */
+
+
+/* The factory maps the correct struct at the provided offset */
+fun h5_message_factory = (uint<8> m_type, uint<16> m_size, offset<uint<64>,B> off) any:
+{
+    if (m_type == 0x00UB)  return H5O_msg_null @ off;      /* Null message: 0x0000 */
+    if (m_type == 0x01UB)  return H5O_msg_sdspace @ off;   /* Dataspace message: 0x0001 */
+    if (m_type == 0x02UB)  return H5O_msg_linfo @ off;     /* Link info message: 0x0002 */
+
+    if (m_type == 0x04UB)  return H5O_msg_old_fill @ off;  /* Fill value message (old): 0x0004 */
+    if (m_type == 0x05UB)  return H5O_msg_fill @ off;      /* Fill value message: 0x0005 */
+    if (m_type == 0x06UB)  return H5O_msg_link @ off;      /* Link message :  0x0006 */
+
+    if (m_type == 0x08UB)  return H5O_msg_layout @ off;    /* layout message :  0x0008 */
+
+    if (m_type == 0x0aUB)  return H5O_msg_ginfo @ off;     /* Group info message :  0x000a */
+    if (m_type == 0x0bUB)  return H5O_msg_pline @ off;     /* Filter pipeline message :  0x000b */
+
+    if (m_type == 0x0dUB)  return H5O_msg_name @ off;      /* Object name message :  0x000d */
+    if (m_type == 0x0eUB)  return H5O_msg_old_mtime @ off;  /* Modification time message (old): 0x000e */
+    if (m_type == 0x010UB) return H5O_msg_cont @ off;      /* Object header continuation message: 0x0010 */
+    if (m_type == 0x011UB) return H5O_msg_stab @ off;      /* Symbol table message: 0x0011 */
+    if (m_type == 0x012UB) return H5O_msg_mtime @ off;     /* Modification time message: 0x0012 */
+    if (m_type == 0x013UB) return H5O_msg_btreek @ off;    /* v1 B-tree 'K' value message: 0x0013 */
+    if (m_type == 0x014UB) return H5O_msg_drvinfo @ off;   /* Driver info message: 0x0014 */
+    if (m_type == 0x015UB) return H5O_msg_ainfo @ off;     /* Attribute info message: 0x0015  */
+
+    if (m_type == 0x017UB) return H5O_msg_fsinfo @ off;    /* File space info message: 0x0017  */
+    if (m_type == 0x018UB) return H5O_msg_mdci @ off;      /* Meta cache image message: 0x0018  */
+
+    /* Fallback for unknown types */
+    return byte[m_size] @ off;
+}
