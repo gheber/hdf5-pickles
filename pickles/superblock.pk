@@ -1,44 +1,4 @@
-fun set_little_endian = void: {
-    set_endian(ENDIAN_LITTLE);
-};
-
-/* All metadata fields are stored in little-endian byte order */
-set_little_endian();
-
-var global_sizeof_offsets = 0 as uint<8>;
-var global_sizeof_lengths = 0 as uint<8>;
-
-fun set_global_sizeof_offsets = (uint<8> sz) int: 
-{
-    global_sizeof_offsets = sz;
-    return 1;
-};
-
-fun set_global_sizeof_lengths = (uint<8> sz) int: 
-{
-    global_sizeof_lengths = sz;
-    return 1;
-};
-
-/* Adopted from codex AI pickle */
-fun h5_bytes_to_u64_le = (byte[] raw) uint<64>:
-{
-  var v = 0 as uint<64>;
-  var shift = 0 as uint<64>;
-
-  for (b in raw) {
-      v = v | ((b as uint<64>) <<. (shift * 8));
-      shift = shift + 1;
-  }
-
-  return v;
-}
-
-/* Adopted from codex AI pickle */
-fun h5_bytes_to_off = (byte[] raw) offset<uint<64>,B>:
-{
-  return h5_bytes_to_u64_le (raw) #B;
-}
+/* Load common.pk */
 
 /* Root group symbol table entry */
 type stab_ent = struct {
