@@ -40,7 +40,7 @@ fun bytes_to_off = (byte[] raw) offset<uint<64>,B>:
     return bytes_to_u64_le (raw) #B;
 }
 
-fun print_char_array = (char[] data) void:
+fun print_char_array = (char[] data) string:
 {
     for (c in data) {
         /* Use %c to print the individual character */
@@ -49,3 +49,24 @@ fun print_char_array = (char[] data) void:
     printf("\n");
 }
 
+fun char_array_to_string = (char[] data) string:
+{
+  var result = ""; /* Start with an empty string */
+
+  for (c in data) {
+    /* Concatenate each character to the result string */
+    result = result + (c as string);
+  }
+
+  return result;
+}
+
+fun indent = (int depth) void:
+{
+  var i = 0;
+  while (i < depth)
+    {
+      print "  ";    /* two spaces per level */
+      i = i + 1;
+    }
+}
