@@ -49,7 +49,7 @@ type H5O_msg_sdspace =
                     indent(depth); printf("  v2=struct {\n");
                     indent(depth); printf("    ndims=%v\n", ndims);
                     indent(depth); printf("    flags=%v\n", flags);
-                    indent(depth); printf("    space_type=%v\n", space_type);
+                    indent(depth); printf("    space_type= %v\n", space_type);
                     indent(depth); printf("    dim_size=%v\n", dim_size);
                     indent(depth); printf("    max= %v\n", max);
                     indent(depth); printf("  }\n");
@@ -94,9 +94,21 @@ type H5O_msg_linfo =
  * For H5O_DTYPE_ID       0x0003 Datatype Message.  
  */
 
-/* Padding is the bits of a data element which are not significant as defined by the precision and offset
- * properties. Padding in the low-numbered bits is lsb padding and padding in the high-numbered bits is msb
- * padding. Padding bits can be set to zero (#H5T_PAD_ZERO) or one (#H5T_PAD_ONE). */
+/* elm_size in dtype_hdr is used in calculating memb_off for version 3 compound type */
+var global_dt_elm_size = 0;
+
+/* The datatype message header section */
+type dtype_hdr = 
+    struct {
+        uint<32> flags;
+        uint<32> elm_size;         
+
+        method get_version = int: { return (flags .>>4 & 0xf) as int; }
+        method get_ctype = int: { return (flags & 0xf) as int; }
+        //method set_global_memb_off_size = int: { global_memb_off_size = elm_size; return 0; }
+        method set_global_dt_elm_size = int: { global_dt_elm_size = elm_size; return 0; }
+
+    };
 
 /* Function to round up a string to multiple of 8 bytes */
 fun round_up_8 = (uint32 n) uint32:
@@ -107,43 +119,243 @@ fun round_up_8 = (uint32 n) uint32:
   return n + (8 - r);
 }
 
-/* Function to determine size of properties for a class type */
-/* NOt all done yet: still have some ctypes undone  */
-fun dtype_props_size = (uint<32> memb_flags) uint32:
+/* Function to calculate the field size of the "Byte Offset of Member" field
+   in the compound properties description version 3 */
+fun get_v3_cmpd_memb_off_size = (uint32 dt_elm_size) uint32:
 {
-    var ctype = memb_flags & 0x0f;
-
-    if (ctype == 0UB)           /* Fixed-point */
-        return (4);
-    else if (ctype == 1UB)      /* Floating-point */
-        return (12);
-    else if (ctype == 2UB)      /* Time */
-        return (2);
-    else if (ctype == 3UB)      /* String */
-        return (0);
-    else if (ctype == 4UB)      /* Bit field */
-        return (4);
-    else if (ctype == 7UB)      /* Reference */
-        return (0);
-    else if (ctype == 9UB)      /* Variable-length */
-        return (4);
-    else 
-        return 0;
+    if (dt_elm_size < 256U)        
+        return 1;  /* compound record < 256B   */
+    else if (dt_elm_size < 65536U)      
+        return 2;  /* compound record < 64KB   */
+    else if (dt_elm_size < 4294967296U) 
+        return 4;  /* compound record < 4GB    */
+    else                             
+        return 8;  /* compound record >= 4GB   */
 }
 
-/* The datatype message header section */
-type dtype_hdr =
-    struct {
-        uint<32> flags;
-        uint<32> elm_size;         
+fun nul_term_len = (off64 off) uint32:
+{
+    var len = 0U;
+    while ((byte @ (off + len#B)) != 0UB)
+        len = len + 1;
+    return len;
+}
 
-        method get_version = int: { return (flags .>>4 & 0xf) as int; }
-        method get_ctype = int: { return (flags & 0xf) as int; }
+fun dtype_props_size_at = (off64 off) uint32:
+{
+    var hdr = dtype_hdr@off;
+    var ctype = hdr.get_ctype();
+    var ver = hdr.get_version();
 
-    };
+    
+    /* ---- class 0: Fixed-Point --------------------------------
+     * bit_offset    uint16
+     * bit_precision uint16
+     * total: 4B
+     * --------------------------------------------------------- */
+    if (ctype == 0UB)
+        return 4;
 
-/* The datatype message properties section */
-type dtype_props =
+    /* ---- class 1: Floating-Point ----------------------------
+     * bit_offset       uint16
+     * bit_precision    uint16
+     * exponent_loc     byte
+     * exponent_size    byte
+     * mantissa_loc     byte
+     * mantissa_size    byte
+     * exponent_bias    uint32
+     * total: 12B
+     * --------------------------------------------------------- */
+    else if (ctype == 1UB)
+        return 12;
+
+    /* ---- class 2: Time --------------------------------------
+     * bit_precision uint16
+     * total: 2B
+     * --------------------------------------------------------- */
+    else if (ctype == 2UB)
+        return 2;
+
+    /* ---- class 3: String ------------------------------------
+     * No property bytes 
+     * total: 0B
+     * --------------------------------------------------------- */
+    else if (ctype == 3UB)
+        return 0;
+
+    /* ---- class 4: Bit Field ---------------------------------
+     * bit_offset    uint16
+     * bit_precision uint16
+     * total: 4B
+     * --------------------------------------------------------- */
+    else if (ctype == 4UB)
+        return 4;
+
+    /* ---- class 5: Opaque ------------------------------------
+     * ASCII tag — length in class_bit_fields[0], padded to 8B
+        NOTE: tag_len should be aligned already when stored
+     *  total: round_up_8 (tag_len)
+     * --------------------------------------------------------- */
+    else if (ctype == 5UB) {
+        var ff = hdr.flags .>>8;
+        var tag_len = (ff & 0xff);
+        return(tag_len);
+
+    } 
+
+    /* ---- class 6: Compound ----------------------------------
+     * Walk all members — version-aware because:
+     *   V1: name(pad8) + uint32 memb_off + ndim(1)+res1(3)+
+     *       perm(4)+res2(4)+adim..ddim(16) + dtype blob
+     *   V2: name(pad8) + uint32 memb_off + dtype blob
+     *   V3: name + variable memb_off + dtype blob
+     * Each member's dtype blob is recursive.
+     * --------------------------------------------------------- */
+    else if (ctype == 6UB) {
+        var ff = hdr.flags .>>8;
+        var nn = (ff & 0xffff);
+
+        /* members start.. */
+        var cur  = off + 8#B;   /* Skip outer header */
+
+        var start = cur;
+        var i     = 0;
+
+        while (i < nn as int) {
+
+            /* name — NUL-terminated, padded to 8B in all versions */
+            var nlen = nul_term_len (cur);
+
+            if (ver == 1UB || ver == 2UB)
+                /* NUL-terminated, padded to next 8B boundary */
+                cur = cur + round_up_8 (nlen + 1)#B;
+            else /* ver == 3UB */
+                /* NUL-terminated only, no padding */
+                cur = cur + (nlen + 1)#B;
+
+            if (ver == 1UB) {
+                cur = cur + 4#B;   /* memb_off  uint32        */
+                cur = cur + 1#B;   /* ndim      byte          */
+                cur = cur + 3#B;   /* res1      byte[3]       */
+                cur = cur + 4#B;   /* perm      byte[4]       */
+                cur = cur + 4#B;   /* res2      byte[4]       */
+                cur = cur + 16#B;  /* adim..ddim 4 x uint32   */
+
+            } else if (ver == 2UB) {
+                cur = cur + 4#B;   /* memb_off  uint32        */
+
+            } else { /* ver == 3UB */
+                /* memb_off width determined by compound element size */
+
+                var off_size = get_v3_cmpd_memb_off_size(hdr.elm_size);
+
+                cur = cur + off_size#B;
+            }
+
+            /* member dtype blob — recursive */
+            var mp = dtype_props_size_at(cur);
+            cur = cur + 8#B + mp#B;
+
+            i = i + 1;
+        }
+
+        return ((cur - start) / 1#B) as uint32;
+
+    }
+
+    /* ---- class 7: Reference ---------------------------------
+     * No property bytes
+     * total: 0B
+     * --------------------------------------------------------- */
+    else if (ctype == 7UB) {
+        return 0;
+    }
+
+    /* ---- class 8: Enum --------------------------------------
+     * base type blob  (8B hdr + props) — recursive
+     * member names    num_members x NUL-terminated, padded to 8B
+     * member values   num_members x base_hdr.elm_size bytes
+     * --------------------------------------------------------- */
+    else if (ctype == 8UB) {
+        var ff = hdr.flags .>>8;
+        var num = (ff & 0xffff);
+        var cur  = off + 8#B;       /* Skip outer header */
+
+        /* base type — recursive */
+        var base_hdr  = dtype_hdr@ cur;
+        var base_size = base_hdr.elm_size;
+        var bp        = dtype_props_size_at(cur);
+        cur = cur + 8#B + bp#B;
+
+        /* member names */
+        var i = 0;
+        while (i < num as int) {
+          var nlen = nul_term_len (cur);
+          cur = cur + round_up_8 (nlen + 1)#B;
+          i = i + 1;
+        }
+
+        /* member values */
+        cur = cur + (num as uint32 * base_size)#B;
+
+        return ((cur - (off + 8#B)) / 1#B) as uint32;
+    }
+
+    /* ---- class 9: Variable-Length ---------------------------
+     * base type blob  (8B hdr + props) — recursive, inline
+     * nothing else
+     * --------------------------------------------------------- */
+    else if (ctype == 9UB) {
+        /* base type — recursive */
+        var bp = dtype_props_size_at(off + 8#B);
+        return (8 + bp);
+    }
+
+    /* ---- class 10: Array ------------------------------------
+     * rank           byte
+     * reserved       byte[3]         (V2 only)
+     * dim_sizes      rank x uint32
+     * permutation    rank x uint32   (V2 only)
+     * base type blob (8B hdr + props) — recursive
+     * --------------------------------------------------------- */
+    else if (ctype == 10UB) {
+        var cur  = off + 8#B;       /* skip outer hdr */
+        var rank = byte @ cur;
+        cur = cur + 1#B;            /* rank */
+
+        if (ver == 2UB)
+            cur = cur + 3#B;        /* V2 only: reserved */
+
+        cur = cur + (rank as uint32 * 4)#B;     /* dim_sizes     */
+
+        if (ver == 2UB)
+            cur = cur + (rank as uint32 * 4)#B; /*  V2 only: permutation */
+
+        /* base type — recursive */
+        var bp = dtype_props_size_at(cur);
+        cur = cur + 8#B + bp#B;
+
+        return ((cur - (off + 8#B)) / 1#B) as uint32;
+
+    }
+
+    /* ---- unknown class --------------------------------------
+     * Return 0
+     * No printf here — silent fallback because it will be called
+     * eagerly by Poke at struct map time
+     *         
+     * --------------------------------------------------------- */
+    else {
+        //printf("dtype_props_size_at: unknown class %u8d at %u64d\n",
+         //       ctype, off / 1#B);
+        return 0;
+    }
+
+
+}
+
+/* The datatype message properties section for compound class type version 1 */
+type compound_props1 = 
     struct {
         string memb_name;
         byte[round_up_8 (memb_name'size / 1#B) - (memb_name'size / 1#B)] pad;
@@ -156,7 +368,7 @@ type dtype_props =
         dtype_hdr memb_hdr;
 
         /* Use memb_flags to determine size of the dtype_props */
-        var ss = dtype_props_size(memb_hdr.flags);
+        var ss = dtype_props_size_at(memb_hdr'offset);
         byte[ss] memb_props; 
 
         method print_indented = (int depth) void:
@@ -169,12 +381,91 @@ type dtype_props =
             indent(depth); printf("    memb_props=%v\n", memb_props);
             indent(depth); printf("  }\n");
         }
+
         method _print = void:
         {
             print_indented (2);
         }
     };
 
+/* The datatype message properties section for compound class type version 2 */
+type compound_props2 =
+    struct {
+        string memb_name;
+        byte[round_up_8 (memb_name'size / 1#B) - (memb_name'size / 1#B)] pad;
+        byte[4] memb_off;
+        dtype_hdr memb_hdr;
+
+        /* Use memb_flags to determine size of the dtype_props */
+        var ss = dtype_props_size_at(memb_hdr'offset);
+        byte[ss] memb_props; 
+
+        method print_indented = (int depth) void:
+        {
+            indent(depth); printf("  membs=struct {\n");
+            indent(depth); printf("    memb_name=%v\n", memb_name);
+            indent(depth); printf("    pad=%v\n", pad);
+            indent(depth); printf("    memb_off=%v\n", memb_off);
+            indent(depth); printf("    memb_hdr=%v\n", memb_hdr);
+            indent(depth); printf("    memb_props=%v\n", memb_props);
+            indent(depth); printf("  }\n");
+        }
+
+        method _print = void:
+        {
+            print_indented (2);
+        }
+    };
+
+/* The datatype message properties section for compound class type version 3 */
+type compound_props3 =
+    struct {
+        string memb_name;
+        byte[get_v3_cmpd_memb_off_size(global_dt_elm_size)] memb_off;
+            dtype_hdr memb_hdr;
+
+            /* Use memb_flags to determine size of the dtype_props */
+            var ss = dtype_props_size_at(memb_hdr'offset);
+            byte[ss] memb_props; 
+
+            method print_indented = (int depth) void:
+            {
+                indent(depth); printf("  membs=struct {\n");
+                indent(depth); printf("    memb_name=%v\n", memb_name);
+                indent(depth); printf("    memb_off=%v\n", memb_off);
+                indent(depth); printf("    memb_hdr=%v\n", memb_hdr);
+                indent(depth); printf("    memb_props=%v\n", memb_props);
+                indent(depth); printf("  }\n");
+            }
+
+            method _print = void:
+            {
+                print_indented (2);
+            }
+        };
+
+/* The datatype message properties section for enumerated class type version 1 & 2 */
+type enum_props =
+    struct {
+        string name;
+        byte[round_up_8 (name'size / 1#B) - (name'size / 1#B)] pad;
+    };
+
+/* The datatype message properties section for array class type version 2 */
+type array_props2 =
+    struct {
+        byte ndims;
+        byte[3] res;
+        uint<32> [ndims] dim_size;
+        uint<32> [ndims] perm_size;
+    };
+
+/* The datatype message properties section for array class type version 3 */
+type array_props3 =
+    struct {
+        byte ndims;
+        uint<32> [ndims] dim_size;
+    };
 
 /* H5O_DTYPE_ID       0x0003 Datatype Message.  */
 type H5O_msg_dtype = 
@@ -184,32 +475,36 @@ type H5O_msg_dtype =
         var ver = hdr.get_version();
         var ctype = hdr.get_ctype();
 
+        /* Just a stub for value returned to temp */
+        /* Used by version 3 compound type properties */
+        var temp = hdr.set_global_dt_elm_size();
+
         union {
             struct {
                 uint<16> bit_offset;
                 uint<16> bit_precision;
 
-                var ff = hdr.flags;
+                var tt = hdr.flags;
                 var ss = hdr.elm_size;
 
-                var t_flags = hdr.flags .>>8;
+                var ff = tt .>>8;
 
-                method byte_order = int: { return (t_flags & 0x1) as int; }
-                method low_pad   = int:  { return (t_flags .>>1 & 0x1) as int; }
-                method high_pad  = int:  { return (t_flags .>>2 & 0x1) as int; }
-                method signed = int:     { return (t_flags .>>3 & 0x1) as int; }
+                method byte_order = int: { return (ff & 0x1) as int; }
+                method low_pad   = int:  { return (ff .>>1 & 0x1) as int; }
+                method high_pad  = int:  { return (ff .>>2 & 0x1) as int; }
+                method signed = int:     { return (ff .>>3 & 0x1) as int; }
 
                 method print_indented = (int depth) void:
                 {
-                    indent(depth); printf("hdr.flags=%v\n", ff);
+                    indent(depth); printf("hdr.flags=%v\n", tt);
                     indent(depth); printf("hdr.elm_size=%v\n", ss);
                     indent(depth); printf("types=struct {\n");
                     indent(depth); printf("  fixed_point=struct {\n");
-                    indent(depth); printf("    Version: %v\n", ver);
-                    indent(depth); printf("    Byte order : %s\n", byte_order() ? "big endian" : "little endian");
-                    indent(depth); printf("    Low pad type : %s\n", low_pad() ? "one" : "zero");
-                    indent(depth); printf("    High pad type : %s\n", high_pad() ? "one" : "zero");
-                    indent(depth); printf("    Sign scheme : %s\n", signed() ? "2's com" : "unsigned type");
+                    indent(depth); printf("    Version:%v\n", ver);
+                    indent(depth); printf("    Byte order:%s\n", byte_order() ? "big endian" : "little endian");
+                    indent(depth); printf("    Low pad type:%s\n", low_pad() ? "one" : "zero");
+                    indent(depth); printf("    High pad type:%s\n", high_pad() ? "one" : "zero");
+                    indent(depth); printf("    Sign scheme:%s\n", signed() ? "2's com" : "unsigned type");
                     indent(depth); printf("    bit_offset=%v\n", bit_offset);
                     indent(depth); printf("    bit_precision=%v\n", bit_precision);
                     indent(depth); printf("  }\n");
@@ -225,15 +520,216 @@ type H5O_msg_dtype =
             } fixed_point: ctype == 0;
 
             struct {
+                uint<16> bit_offset;
+                uint<16> bit_precision;
+                uint<8> eloc;
+                uint<8> esize;
+                uint<8> mloc;
+                uint<8> msize;
+                uint<32> ebias;
+
+                var tt = hdr.flags;
+                var ss = hdr.elm_size;
+                var ff = tt .>>8;
+
+                method vax_byte_order = int: 
+                { 
+                    if (ver >= 3) {
+                        return (((ff .>> 6 & 0x1) && ff & 0x1)) as int;
+                    } else
+                        return(0);
+                }
+
+                method byte_order = int: { return (ff & 0x1) as int; }
+
+                method low_pad  = int:      { return (ff .>>1 & 0x1) as int; }
+                method high_pad = int:      { return (ff .>>2 & 0x1) as int; }
+                method internal_pad = int:  { return (ff .>>3 & 0x1) as int; }
+
+                method norm  = int:{ return (ff .>>4 & 0x3) as int; }
+
+                method sign_loc = int:     { return (ff .>>8 & 0xff) as int; }
+
+                method print_indented = (int depth) void:
+                {
+                    var vax = vax_byte_order();
+                    var nn = norm();
+
+                    indent(depth); printf("hdr.flags=%v\n", tt);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  floating_point=struct {\n");
+
+                    indent(depth); printf("    Version:%v\n", ver);
+                    indent(depth); printf("    Byte order:%s\n", vax ? "VAX" : (byte_order() ? "big endian" : "little endian"));
+                    indent(depth); printf("    Low pad type:%s\n", low_pad() ? "one" : "zero");
+                    indent(depth); printf("    High pad type:%s\n", high_pad() ? "one" : "zero");
+                    indent(depth); printf("    Internal pad type:%s\n", internal_pad() ? "one" : "zero");
+                    /* Questionable about implied and none in the library coding v.s. debug coding */
+                    indent(depth); printf("    Normalization:%s\n", nn == 0 ? "none" : (nn == 1 ? "msb set" : "implied"));
+                    indent(depth); printf("    Sign bit location:%v\n", sign_loc());
+
+                    indent(depth); printf("    bit_offset=%v\n", bit_offset);
+                    indent(depth); printf("    bit_precision=%v\n", bit_precision);
+                    indent(depth); printf("    exponent_location=%v\n", eloc);
+                    indent(depth); printf("    exponent_size=%v\n", esize);
+                    indent(depth); printf("    mantissa_location=%v\n", mloc);
+                    indent(depth); printf("    mantissa_size=%v\n", msize);
+                    indent(depth); printf("    exponent_bias=%v\n", ebias);
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+                }
+
+                method _print = void:
+                {
+                    print_indented (1);
+                }
+
+            } floating_point: ctype == 1;
+
+            /* Not verified yet for time */
+            struct {
+                uint<32> bit_precision;
+
+                var tt = hdr.flags;
+                var ss = hdr.elm_size;
+                var ff = tt .>>8;
+
+                method byte_order = int: { return (ff & 0x1) as int; }
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", tt);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  time=struct {\n");
+                    indent(depth); printf("    Version:%v\n", ver);
+                    indent(depth); printf("    Byte order:%s\n", byte_order() ? "big endian" : "little endian");
+                    indent(depth); printf("    bit_precision=%v\n", bit_precision);
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+                }
+
+                method _print = void: 
+                {
+                    print_indented (1);
+                }
+
+            } time: ctype == 2;
+ 
+            struct {
+                var tt = hdr.flags;
+                var ss = hdr.elm_size;
+                var ff = tt .>>8;
+
+                method pad_type = int: { return (ff & 0xf) as int; }
+                method cset = int: { return (ff .>> 4 & 0xf) as int; }
+
+                method print_indented = (int depth) void:
+                {
+                    var pp = pad_type();
+                    var cs = cset();
+
+                    indent(depth); printf("hdr.flags=%v\n", tt);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  string=struct {\n");
+                    indent(depth); printf("    Version:%v\n", ver);
+                    indent(depth); printf("    String padding:%s\n", pp == 0 ? "NULL Terminated" : (pp == 1 ? "NULL Padded" : "Space Padded"));
+                    indent(depth); printf("    Character set:%s\n", cs == 0 ? "ASCII" : "UTF-8");
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+                }
+
+                method _print = void: 
+                {
+                    print_indented (1);
+                }
+
+            } text_string: ctype  == 3;
+
+            struct {
+                uint<16> bit_offset;
+                uint<16> bit_precision;
+
+                var tt = hdr.flags;
+                var ss = hdr.elm_size;
+                var ff = tt .>>8;
+
+                method byte_order = int: { return (ff & 0x1) as int; }
+                method low_pad   = int:  { return (ff .>>1 & 0x1) as int; }
+                method high_pad  = int:  { return (ff .>>2 & 0x1) as int; }
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", tt);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  bitfield=struct {\n");
+                    indent(depth); printf("    Version:%v\n", ver);
+                    indent(depth); printf("    Byte order:%s\n", byte_order() ? "big endian" : "little endian");
+                    indent(depth); printf("    Low pad type:%s\n", low_pad() ? "one" : "zero");
+                    indent(depth); printf("    High pad type:%s\n", high_pad() ? "one" : "zero");
+                    indent(depth); printf("    bit_offset=%v\n", bit_offset);
+                    indent(depth); printf("    bit_precision=%v\n", bit_precision);
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+                }
+
+                method _print = void: 
+                {
+                    print_indented (1);
+                }
+
+            } bitfield: ctype == 4;
+
+            struct {
+                string tag;
+                byte[round_up_8 (tag'size / 1#B) - (tag'size / 1#B)] pad;
+
+                var tt = hdr.flags;
+                var ss = hdr.elm_size;
+                var ff = tt .>>8;
+            
+                method tag_len = int: { return (ff & 0xff) as int; }
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", tt);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  opaque=struct {\n");
+                    indent(depth); printf("    Version:%v\n", ver);
+                    indent(depth); printf("    Length of tag:%v\n", tag_len());
+                    indent(depth); printf("    tag=%s\n", tag);
+                    indent(depth); printf("    pad=%v\n", pad);
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+                }
+
+                method _print = void: 
+                {
+                    print_indented (1);
+                }
+
+            } opaque: ctype == 5;
+
+            /* compound: Not verified yet for v2??  and v3 */
+            struct {
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;
 
                 var t_flags = hdr.flags .>>8;
-                var n = t_flags & 0xffff;
+                var nn = t_flags & 0xffff;
 
                 method nmembs = int: { return (t_flags & 0xffff) as int; }
 
-                dtype_props[n] membs;
+                
+                union {
+                    compound_props1[nn] v1: ver == 1;
+                    compound_props2[nn] v2: ver == 2;
+                    compound_props3[nn] v3: ver >= 3;
+                } membs;
 
                 method print_indented = (int depth) void:
                 {
@@ -247,7 +743,13 @@ type H5O_msg_dtype =
 
                     var i = 0;
                     while (i < n) {
-                       membs[i].print_indented(depth+1);
+                       //membs[i].print_indented(depth+1);
+                        if (ver == 1)
+                            membs.v1[i].print_indented(depth+1);
+                        else if (ver == 2)
+                            membs.v2[i].print_indented(depth+1);
+                        else if (ver >= 3)
+                            membs.v3[i].print_indented(depth+1);
                         i++;
                     }
                     indent(depth); printf("  }\n");
@@ -261,6 +763,175 @@ type H5O_msg_dtype =
                 }
 
             } compound: ctype == 6;
+
+            struct {
+
+                var tt = hdr.flags;
+                var ss = hdr.elm_size;
+                var ff = tt .>>8;
+            
+                method rtype = int: { return (ff & 0xf) as int; }
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", tt);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  Reference=struct {\n");
+                    indent(depth); printf("    Version:%v\n", ver);
+
+                    var rr = rtype();
+
+                    if (ver < 4) {
+                        indent(depth); printf("    Reference type:%v\n", rr == 0 ? "H5R_OBJECT1" : "H5R_DATASET_REGION1");
+                    } else {
+                        indent(depth); printf("    Reference type:%v\n", rr == 2 ? "H5R_OBJECT2" : (rr == 3 ? "H5R_DATASET_REGION2" : "H5R_ATTR"));
+                        indent(depth); printf("    Encoded version type:%v\n", (ff .>> 4 & 0x0f));
+                    }
+
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+                }
+
+                method _print = void: 
+                {
+                    print_indented (1);
+                }
+
+            } reference: ctype == 7;
+
+            struct {
+                var ff = hdr.flags;
+                var ss = hdr.elm_size;
+
+                var t_flags = hdr.flags .>>8;
+                var nn = t_flags & 0xffff;
+
+                method nmembs = int: { return (t_flags & 0xffff) as int; }
+
+                dtype_hdr base_hdr;
+
+                /* Use base_hdr.flags to get class type to determine property size for each class type */
+                //var jj = dtype_props_size(base_hdr.flags);
+                var jj = dtype_props_size_at(base_hdr'offset);
+                byte[jj] base_props; 
+
+                union {
+                    enum_props[nn] v1_2: ver <= 2;
+                    string[nn] v3: ver >= 3;
+                } memb_names;
+
+                byte[nn*base_hdr.elm_size] memb_values;
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", ff);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  enumeration=struct {\n");
+                    indent(depth); printf("    Version: %v\n", ver);
+                    var n = nmembs();
+                    indent(depth); printf("    Number of members: %v\n", n);
+                    indent(depth); printf("    base_hdr=%v\n", base_hdr);
+                    indent(depth); printf("    base_props=%v\n", base_props);
+
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+
+                }
+
+                method _print = void:
+                {
+                    print_indented (1);
+                }
+
+            } enumeration: ctype == 8;
+
+            struct {
+
+                var ff = hdr.flags;
+                var ss = hdr.elm_size;
+
+                var t_flags = hdr.flags .>>8;
+
+                method vlen_type = int: { return (t_flags & 0x0f) as int; }
+
+                dtype_hdr base_hdr;
+
+                /* Determine property size for each class type */
+                var jj = dtype_props_size_at(base_hdr'offset);
+                byte[jj] base_props; 
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", ff);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  variable-length=struct {\n");
+                    indent(depth); printf("    Version: %v\n", ver);
+                    var vtype = vlen_type();
+                    indent(depth); printf("    Type: %s\n", vtype == 0 ? "sequence" : "string");
+
+                    indent(depth); printf("    base_hdr=%v\n", base_hdr);
+                    indent(depth); printf("    base_props=%v\n", base_props);
+
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+
+                }
+
+                method _print = void:
+                {
+                    print_indented (1);
+                }
+
+            } variable_length: ctype == 9;
+
+            struct {
+                var ff = hdr.flags;
+                var ss = hdr.elm_size;
+
+                /* Version shouldn't be less than 2 */
+                union {
+                    array_props2 v2: ver == 2;
+                    array_props3 v3: ver == 3;
+                    byte[20] unknown;
+                } arr;
+
+                dtype_hdr base_hdr;
+
+                /* Determine property size for each class type */
+                var jj = dtype_props_size_at(base_hdr'offset);
+                byte[jj] base_props; 
+
+                method print_indented = (int depth) void:
+                {
+                    indent(depth); printf("hdr.flags=%v\n", ff);
+                    indent(depth); printf("hdr.elm_size=%v\n", ss);
+                    indent(depth); printf("types=struct {\n");
+                    indent(depth); printf("  array=struct {\n");
+                    indent(depth); printf("    Version: %v\n", ver);
+
+                    if (ver == 2) {
+                        indent(depth); printf("    arr.v2=%v\n", arr.v2);
+                    } else if (ver == 3) {
+                        indent(depth); printf("    arr.v3=%v\n", arr.v3);
+                    }
+
+                    indent(depth); printf("    base_hdr=%v\n", base_hdr);
+                    indent(depth); printf("    base_props=%v\n", base_props);
+
+                    indent(depth); printf("  }\n");
+                    indent(depth); printf("}\n");
+
+                }
+
+                method _print = void:
+                {
+                    print_indented (1);
+                }
+
+            } array: ctype == 10;
 
         } types;
 
@@ -278,32 +949,135 @@ type H5O_msg_dtype =
                 printf("H5O_msg_dtype {\n");
                 types.fixed_point._print;
                 printf("}");
-            } 
+            } else if (ctype == 1) {
+                printf("H5O_msg_dtype {\n");
+                types.floating_point._print;
+                printf("}");
+            } else if (ctype == 2) {
+                printf("H5O_msg_dtype {\n");
+                types.time._print;
+                printf("}");
+            } else if (ctype == 3) {
+                printf("H5O_msg_dtype {\n");
+                types.text_string._print;
+                printf("}");
+            } else if (ctype == 4) {
+                printf("H5O_msg_dtype {\n");
+                types.bitfield._print;
+                printf("}");
+            } else if (ctype == 5) {
+                printf("H5O_msg_dtype {\n");
+                types.opaque._print;
+                printf("}");
+            } else if (ctype == 7) {
+                printf("H5O_msg_dtype {\n");
+                types.reference._print;
+                printf("}");
+            } else if (ctype > 10) {
+                /* Unknown class warning belongs here, not in dtype_props_size_at() calculator */
+                printf ("Unknown class type=%v\n", ctype);
+
+            }
         }
     };
 
+/* Function to recursively print datatype info */
 fun print_recurse_dtype = (H5O_msg_dtype dt, int depth) void:
 {
-    var ctype = dt.hdr.flags & 0xf;
+    var ctype = dt.hdr.get_ctype();
+    var ver = dt.hdr.get_version();
   
-    if (ctype == 0) /* Fixed Point */
-    {
+    if (ctype == 0) { /* Fixed Point */
+
         dt.types.fixed_point.print_indented(depth+1);
-    }
-    else if (ctype == 6) /* Compound */
-    {
+
+    } else if (ctype == 1) { /* Floating Point */
+
+        dt.types.floating_point.print_indented(depth+1);
+
+    } else if (ctype == 2) {
+
+        dt.types.time.print_indented(depth+1);
+
+    } else if (ctype == 3) {
+
+        dt.types.text_string.print_indented(depth+1);
+
+    } else if (ctype == 4) {
+
+        dt.types.bitfield.print_indented(depth+1);
+    
+    } else if (ctype == 5) {
+
+        dt.types.opaque.print_indented(depth+1);
+
+    } else if (ctype == 6) { /* Compound */
+        dt.types.compound.print_indented(depth+1);
+
         var n = dt.types.compound.nmembs();
         var i = 0;
         while (i < n) {
             indent(depth+1); printf("Member %v:\n", i);
             indent(depth+1); printf("  H5O_msg_dtype {\n");
-            var memb_dt = H5O_msg_dtype @ dt.types.compound.membs[i].memb_hdr'offset;
-            var tt = dt.hdr.flags & 0xf;
-            print_recurse_dtype(memb_dt, depth+2);
-            indent(depth+1); printf(" }\n");
+            if (ver == 1) {
+                var memb_dt = H5O_msg_dtype @ dt.types.compound.membs.v1[i].memb_hdr'offset;
+                print_recurse_dtype(memb_dt, depth+2);
+                indent(depth+1); printf("  }\n");
+            } else if (ver == 2) {
+                var memb_dt = H5O_msg_dtype @ dt.types.compound.membs.v2[i].memb_hdr'offset;
+                print_recurse_dtype(memb_dt, depth+2);
+                indent(depth+1); printf("  }\n");
+            } else if (ver >= 3) {
+                var memb_dt = H5O_msg_dtype @ dt.types.compound.membs.v3[i].memb_hdr'offset;
+                print_recurse_dtype(memb_dt, depth+2);
+                indent(depth+1); printf("  }\n");
+            }
             i++;
         }
-    }
+    } else if (ctype == 7) {
+
+        dt.types.reference.print_indented(depth+1);
+
+    } else if (ctype == 8) {
+
+        dt.types.enumeration.print_indented(depth+1);
+
+        var n = dt.types.enumeration.nmembs();
+        var i = 0;
+        var memb_dt = H5O_msg_dtype @ dt.types.enumeration.base_hdr'offset;
+        indent(depth+1); printf("Base type: {\n");
+        print_recurse_dtype(memb_dt, depth+1);
+        indent(depth+1); printf("}\n");
+        while (i < n) {
+            if (ver <= 2) {
+                indent(depth+1); printf("Member %v:\n", i);
+                indent(depth+2); printf("names=%v\n", dt.types.enumeration.memb_names.v1_2[i]);
+            } else if (ver >= 3) {
+                indent(depth+1); printf("Member %v:\n", i);
+                indent(depth+2); printf("names=%v\n", dt.types.enumeration.memb_names.v3[i]);
+            }
+            i++;
+        }
+
+    } else if (ctype == 9) {
+
+        dt.types.variable_length.print_indented(depth+1);
+
+        var memb_dt = H5O_msg_dtype @ dt.types.variable_length.base_hdr'offset;
+        indent(depth+1); printf("Base type: {\n");
+        print_recurse_dtype(memb_dt, depth+1);
+        indent(depth+1); printf("}\n");
+
+    } else if (ctype == 10) {
+
+        dt.types.array.print_indented(depth+1);
+
+        var memb_dt = H5O_msg_dtype @ dt.types.array.base_hdr'offset;
+        indent(depth+1); printf("Base type: {\n");
+        print_recurse_dtype(memb_dt, depth+1);
+        indent(depth+1); printf("}\n");
+
+    } 
 }
 
 
@@ -584,6 +1358,7 @@ type H5O_msg_attr =
         uint<16> name_size;
         uint<16> dtype_size;
         uint<16> dspace_size;
+        uint<8> cset if version == 3;
 
         /* Function to align size */
         fun align_size = (uint<16> x) uint<16>:
@@ -638,10 +1413,12 @@ type H5O_msg_attr =
             printf("H5O_msg_attr {\n");
 
             printf("  version=%v\n", version);
-            printf("  %s: %v\n", (version == 1 ? "reserved=" : "flags="), flags);
+            printf("  %s%v\n", (version == 1 ? "reserved=" : "flags="), flags);
             printf("  name_size=%v\n", name_size);
             printf("  dtype_size=%v\n", dtype_size);
             printf("  dspace_size=%v\n", dspace_size);
+            if (version == 3)
+                printf("  cset=%v\n", cset == 0 ? "ASCII" : "UTF-8");
 
             printf("  name=%v-->%v\n", name, char_array_to_string(name));
 

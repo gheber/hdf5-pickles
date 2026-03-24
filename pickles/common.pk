@@ -1,4 +1,5 @@
-fun set_little_endian = void: {
+fun set_little_endian = void: 
+{
     set_endian(ENDIAN_LITTLE);
 };
 

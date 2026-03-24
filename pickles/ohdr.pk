@@ -83,7 +83,19 @@ fun Get_messages = (uint<8> version, int prefix_bytes, offset<uint<64>,B> chunk_
                 var pp = payload as H5O_msg_dtype;
                 if ((pp.hdr.flags & 0xf) == 6) { /* compound type */
                     indent(0); printf("H5O_msg_dtype {\n");
-                    pp.types.compound.print_indented(1);
+                    //pp.types.compound.print_indented(1);
+                    print_recurse_dtype(pp, 0);
+                } else if ((pp.hdr.flags & 0xf) == 8) { /* enumeration type */
+                    indent(0); printf("H5O_msg_dtype {\n");
+                    //pp.types.enumeration.print_indented(1);
+                    print_recurse_dtype(pp, 0);
+                } else if ((pp.hdr.flags & 0xf) == 9) { /* variable-length type */
+                    indent(0); printf("H5O_msg_dtype {\n");
+                    //pp.types.variable_length.print_indented(1);
+                    print_recurse_dtype(pp, 0);
+                } else if ((pp.hdr.flags & 0xf) == 10) { /* array type */
+                    indent(0); printf("H5O_msg_dtype {\n");
+                    //pp.types.array.print_indented(1);
                     print_recurse_dtype(pp, 0);
                 }
             } 
