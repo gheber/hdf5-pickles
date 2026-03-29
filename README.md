@@ -31,6 +31,7 @@ At the `(poke)` prompt, load the pickles needed for the superblock and object he
 load common
 load superblock
 load ohdr
+load lookup3
 ```
 
 These commands do not print anything on success; poke simply returns to the prompt.
