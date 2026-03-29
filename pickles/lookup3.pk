@@ -1,0 +1,240 @@
+/* lookup3.pk - Jenkins lookup3 hash implementation compatible with
+   https://www.burtleburtle.net/bob/c/lookup3.c */
+
+fun lookup3_rot = (uint<32> x, int k) uint<32>:
+{
+  return (x <<. k) | (x .>> (32 - k));
+}
+
+fun lookup3_hashsize = (int n) uint<32>:
+{
+  return 1U <<. n;
+}
+
+fun lookup3_hashmask = (int n) uint<32>:
+{
+  return lookup3_hashsize (n) - 1U;
+}
+
+fun lookup3_u32_le = (byte[] raw) uint<32>:
+{
+  var v = 0 as uint<32>;
+  var shift = 0 as uint<32>;
+
+  for (b in raw)
+    {
+      v |= (b as uint<32>) <<. (shift * 8);
+      shift += 1;
+    }
+
+  return v;
+}
+
+fun lookup3_u32_be = (byte[] raw) uint<32>:
+{
+  var v = 0 as uint<32>;
+
+  for (b in raw)
+    {
+      v = (v <<. 8) | (b as uint<32>);
+    }
+
+  return v;
+}
+
+fun lookup3_mix = (uint<32> a, uint<32> b, uint<32> c) uint<32>[]:
+{
+  a -= c; a ^= lookup3_rot (c, 4);  c += b;
+  b -= a; b ^= lookup3_rot (a, 6);  a += c;
+  c -= b; c ^= lookup3_rot (b, 8);  b += a;
+  a -= c; a ^= lookup3_rot (c, 16); c += b;
+  b -= a; b ^= lookup3_rot (a, 19); a += c;
+  c -= b; c ^= lookup3_rot (b, 4);  b += a;
+  return [a, b, c];
+}
+
+fun lookup3_final = (uint<32> a, uint<32> b, uint<32> c) uint<32>[]:
+{
+  c ^= b; c -= lookup3_rot (b, 14);
+  a ^= c; a -= lookup3_rot (c, 11);
+  b ^= a; b -= lookup3_rot (a, 25);
+  c ^= b; c -= lookup3_rot (b, 16);
+  a ^= c; a -= lookup3_rot (c, 4);
+  b ^= a; b -= lookup3_rot (a, 14);
+  c ^= b; c -= lookup3_rot (b, 24);
+  return [a, b, c];
+}
+
+fun lookup3_hashword_core = (uint<32>[] key, uint<32> pc, uint<32> pb = 0) uint<32>[]:
+{
+  var length = key'length;
+  var a = (0xdeadbeef as uint<32>) + ((length as uint<32>) <<. 2) + pc;
+  var b = a;
+  var c = a + pb;
+  var p = 0;
+
+  while (length > 3)
+    {
+      var mixed = uint<32>[]();
+
+      a += key[p];
+      b += key[p+1];
+      c += key[p+2];
+      mixed = lookup3_mix (a, b, c);
+      a = mixed[0];
+      b = mixed[1];
+      c = mixed[2];
+      p += 3;
+      length -= 3;
+    }
+
+  if (length == 0)
+    return [a, b, c];
+
+  if (length >= 3)
+    c += key[p+2];
+  if (length >= 2)
+    b += key[p+1];
+  if (length >= 1)
+    a += key[p];
+
+  return lookup3_final (a, b, c);
+}
+
+fun lookup3_hashword = (uint<32>[] key, uint<32> initval = 0) uint<32>:
+{
+  var state = lookup3_hashword_core (key, initval, 0);
+  return state[2];
+}
+
+fun lookup3_hashword2 = (uint<32>[] key, uint<32> pc, uint<32> pb) uint<32>[]:
+{
+  var state = lookup3_hashword_core (key, pc, pb);
+  return [state[2], state[1]];
+}
+
+fun lookup3_hashlittle_core = (byte[] data, uint<32> pc, uint<32> pb = 0) uint<32>[]:
+{
+  var length = data'length;
+  var a = (0xdeadbeef as uint<32>) + (length as uint<32>) + pc;
+  var b = a;
+  var c = a + pb;
+  var p = 0;
+
+  while (length > 12)
+    {
+      var mixed = uint<32>[]();
+
+      a += lookup3_u32_le (data[p:p+4]);
+      b += lookup3_u32_le (data[p+4:p+8]);
+      c += lookup3_u32_le (data[p+8:p+12]);
+      mixed = lookup3_mix (a, b, c);
+      a = mixed[0];
+      b = mixed[1];
+      c = mixed[2];
+      p += 12;
+      length -= 12;
+    }
+
+  if (length == 0)
+    return [a, b, c];
+
+  if (length >= 12)
+    c += (data[p+11] as uint<32>) <<. 24;
+  if (length >= 11)
+    c += (data[p+10] as uint<32>) <<. 16;
+  if (length >= 10)
+    c += (data[p+9] as uint<32>) <<. 8;
+  if (length >= 9)
+    c += data[p+8] as uint<32>;
+  if (length >= 8)
+    b += (data[p+7] as uint<32>) <<. 24;
+  if (length >= 7)
+    b += (data[p+6] as uint<32>) <<. 16;
+  if (length >= 6)
+    b += (data[p+5] as uint<32>) <<. 8;
+  if (length >= 5)
+    b += data[p+4] as uint<32>;
+  if (length >= 4)
+    a += (data[p+3] as uint<32>) <<. 24;
+  if (length >= 3)
+    a += (data[p+2] as uint<32>) <<. 16;
+  if (length >= 2)
+    a += (data[p+1] as uint<32>) <<. 8;
+  if (length >= 1)
+    a += data[p] as uint<32>;
+
+  return lookup3_final (a, b, c);
+}
+
+fun lookup3_hashlittle = (byte[] data, uint<32> initval = 0) uint<32>:
+{
+  var state = lookup3_hashlittle_core (data, initval, 0);
+  return state[2];
+}
+
+fun lookup3_hashlittle2 = (byte[] data, uint<32> pc, uint<32> pb) uint<32>[]:
+{
+  var state = lookup3_hashlittle_core (data, pc, pb);
+  return [state[2], state[1]];
+}
+
+fun lookup3_hashbig_core = (byte[] data, uint<32> initval) uint<32>[]:
+{
+  var length = data'length;
+  var a = (0xdeadbeef as uint<32>) + (length as uint<32>) + initval;
+  var b = a;
+  var c = a;
+  var p = 0;
+
+  while (length > 12)
+    {
+      var mixed = uint<32>[]();
+
+      a += lookup3_u32_be (data[p:p+4]);
+      b += lookup3_u32_be (data[p+4:p+8]);
+      c += lookup3_u32_be (data[p+8:p+12]);
+      mixed = lookup3_mix (a, b, c);
+      a = mixed[0];
+      b = mixed[1];
+      c = mixed[2];
+      p += 12;
+      length -= 12;
+    }
+
+  if (length == 0)
+    return [a, b, c];
+
+  if (length >= 12)
+    c += data[p+11] as uint<32>;
+  if (length >= 11)
+    c += (data[p+10] as uint<32>) <<. 8;
+  if (length >= 10)
+    c += (data[p+9] as uint<32>) <<. 16;
+  if (length >= 9)
+    c += (data[p+8] as uint<32>) <<. 24;
+  if (length >= 8)
+    b += data[p+7] as uint<32>;
+  if (length >= 7)
+    b += (data[p+6] as uint<32>) <<. 8;
+  if (length >= 6)
+    b += (data[p+5] as uint<32>) <<. 16;
+  if (length >= 5)
+    b += (data[p+4] as uint<32>) <<. 24;
+  if (length >= 4)
+    a += data[p+3] as uint<32>;
+  if (length >= 3)
+    a += (data[p+2] as uint<32>) <<. 8;
+  if (length >= 2)
+    a += (data[p+1] as uint<32>) <<. 16;
+  if (length >= 1)
+    a += (data[p] as uint<32>) <<. 24;
+
+  return lookup3_final (a, b, c);
+}
+
+fun lookup3_hashbig = (byte[] data, uint<32> initval = 0) uint<32>:
+{
+  var state = lookup3_hashbig_core (data, initval);
+  return state[2];
+}
