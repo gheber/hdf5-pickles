@@ -12,6 +12,7 @@ This repository is a work in progress. The current pickles focus on core HDF5 me
 - `pickles/superblock.pk`: HDF5 superblock definitions
 - `pickles/ohdr.pk`: object header definitions
 - `pickles/messages.pk`: object header message definitions
+- `pickles/lookup3.pk`: implementation of the lookup3 hash function used for checksums
 
 ## Quick Tutorial
 
@@ -30,6 +31,7 @@ At the `(poke)` prompt, load the pickles needed for the superblock and object he
 load common
 load superblock
 load ohdr
+load lookup3
 ```
 
 These commands do not print anything on success; poke simply returns to the prompt.
@@ -58,10 +60,46 @@ This tells us that `file.h5` uses a version 2 superblock and that the root objec
 
 ### 2. Decode the root object header
 
-Map the root object header and print its decoded messages:
-
 ```poke
 var root = ohdr @ root_addr
+root
+```
+
+Expected output snippet:
+
+```text
+ohdr {sig_peek=[79UB,72UB,68UB,82UB],_ohdr=struct {v2=struct {signature=[79UB,72UB,68UB,82UB],version=2UB,flags=32UB,timestamps=Timestamps {access=1773447782U,modification=1773447782U,change=1773447782U,birth=1773447782U},chunk0_size=[120UB],_msg_chunk=struct {msg_chunk=[2UB,18UB,0UB,0UB,0UB,0UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB,10UB,2UB,0UB,1UB,0UB,0UB,6UB,26UB,0UB,0UB,1UB,0UB,15UB,68UB,105UB,114UB,101UB,99UB,116UB,67UB,104UB,117UB,110UB,107UB,68UB,97UB,116UB,97UB,195UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,58UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB,0UB]},chksum=[7UB,68UB,33UB,252UB]}}}
+```
+
+We are looking at a version 2 object header. Unlike the earlier version, it comes with a checksum. You can verify the checksum with the `lookup3_hashlittle` function from `lookup3.pk`:
+
+```poke
+lookup3_u32_le(root._ohdr.v2.chksum)
+```
+
+Expected output:
+
+```text
+4230038535U
+```
+
+Let's calculate the checksum ourselves to see how it works. The checksum is computed over the *entire object header* (including the prefix) except for the checksum field ( 4 bytes) itself, which is located at the end of the header.
+
+```poke
+lookup3_hashlittle(byte[root'size as offset<uint<64>,B> - 4UL#B] @ root_addr, 0)
+```
+
+Expected output:
+
+```text
+4230038535U
+```
+
+Phew! This confirms that the checksum is correct and that we understand how to compute it.
+
+Print the root object header's decoded messages:
+
+```poke
 root.get_messages ()
 ```
 
