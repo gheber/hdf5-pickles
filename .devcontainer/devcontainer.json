@@ -1,0 +1,16 @@
+{
+    "name": "SHAPE5 Codespace",
+    "build": {
+        "dockerfile": "Dockerfile"
+    },
+    "remoteUser": "vscode",
+    "updateRemoteUserUID": true,
+    "postCreateCommand": "sudo pacman -Syu --noconfirm",
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "h5web.vscode-h5web"
+            ]
+        }
+    }
+}

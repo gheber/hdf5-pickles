@@ -12,6 +12,7 @@ This repository is a work in progress. The current pickles focus on core HDF5 me
 - `pickles/superblock.pk`: HDF5 superblock definitions
 - `pickles/ohdr.pk`: object header definitions
 - `pickles/messages.pk`: object header message definitions
+- `pickles/construct.pk`: helpers for constructing version 2 metadata in memory
 - `pickles/lookup3.pk`: implementation of the lookup3 hash function used for checksums
 
 ## Quick Tutorial
@@ -241,6 +242,104 @@ Expected output:
 ```
 
 This demonstrates byte-level write-through via the mapped pickle types. It does not automatically update higher-level HDF5 consistency metadata, so for real edits you may also need to recompute dependent fields such as checksums.
+
+### 6. Creating an "empty" HDF5 file
+
+We can also build a minimal HDF5 file from scratch: a version 2 superblock followed by a version 2 root object header for the root group. This time we construct the metadata in a memory-backed IOS first, and only save it to disk at the end.
+
+Start poke from the repository root without opening a file yet:
+
+```sh
+cd <THIS DIRECTORY>
+POKE_LOAD_PATH=$PWD/pickles poke
+```
+
+At the `(poke)` prompt, load the helper pickle and create a fresh memory IOS:
+
+```poke
+load construct
+load lookup3
+.mem image
+```
+
+First construct the version 2 superblock value. The root object header will start at offset `48#B`, and the final image size will be `179#B`:
+
+```poke
+var undef_addr = u64_to_bytes_le (0xffffffffffffffffUL, 8)
+var sb = superblock_v2 { sizeof_offsets = 8UB, sizeof_lengths = 8UB, ext_addr_raw = undef_addr, eof_addr_raw = u64_to_bytes_le (179UL, 8), root_obj_addr_raw = u64_to_bytes_le (48UL, 8) }
+```
+
+Now stage the root-group messages in the memory IOS at offset `1024#B`. That offset is arbitrary; we just use it as scratch space while building the object header chunk. The memory IOS starts zero-filled, so the `88` data bytes of the NIL message do not need any explicit initialization.
+
+```poke
+msg_prefix_v2 @ 1024#B = msg_prefix_v2 { msg_type = 2UB, msg_size = 18UH, msg_flags = 0UB }
+H5O_msg_linfo @ 1028#B = H5O_msg_linfo { version = 0UB, flags = 0UB, fheap_addr_raw = undef_addr, name_bt2_addr_raw = undef_addr }
+
+msg_prefix_v2 @ 1046#B = msg_prefix_v2 { msg_type = 10UB, msg_size = 2UH, msg_flags = 1UB }
+H5O_msg_ginfo @ 1050#B = H5O_msg_ginfo { version = 0UB, flags = 0UB }
+
+msg_prefix_v2 @ 1052#B = msg_prefix_v2 { msg_type = 0UB, msg_size = 88UH, msg_flags = 0UB }
+
+var root = ohdr_v2 { flags = 0UB, chunk0_size = [120UB], msg_chunk = byte[120] @ 1024#B }
+```
+
+Serialize the typed values into the first `179` bytes of the memory IOS, compute the checksums, and save the result to disk:
+
+```poke
+superblock_v2 @ 0#B = sb
+var sb_map = superblock_v2 @ 0#B
+sb_map.chksum = lookup3_hashlittle(byte[44] @ 0#B, 0)
+
+ohdr_v2 @ 48#B = root
+var root_map = ohdr_v2 @ 48#B
+root_map.chksum = lookup3_hashlittle(byte[127] @ 48#B, 0)
+
+save :file "empty.h5" :size 179#B
+```
+
+Finally, map the image back using the parser pickles and verify it:
+
+```poke
+var sb2 = superblock @ 0#B
+var root2 = ohdr @ 48#B
+
+sb2.super_vers
+bytes_to_off (sb2.super.v2_v3.root_obj_addr_raw)
+lookup3_hashlittle(byte[44] @ 0#B, 0)
+lookup3_u32_le(root2._ohdr.v2.chksum)
+lookup3_hashlittle(byte[root2'size as offset<uint<64>,B> - 4UL#B] @ 48#B, 0)
+root2.get_messages ()
+```
+
+Expected output snippet:
+
+```text
+(poke) sb2.super_vers
+2UB
+(poke) bytes_to_off (sb2.super.v2_v3.root_obj_addr_raw)
+48UL#B
+(poke) lookup3_hashlittle(byte[44] @ 0#B, 0)
+673867655U
+(poke) lookup3_u32_le(root2._ohdr.v2.chksum)
+2898835909U
+(poke) lookup3_hashlittle(byte[root2'size as offset<uint<64>,B> - 4UL#B] @ 48#B, 0)
+2898835909U
+
+Message 0...
+H5O_msg_linfo { ... }
+
+Message 1...
+H5O_msg_ginfo {
+  version=0UB,
+  flags=0UB
+}
+
+Message 2...
+H5O_msg_nil {
+}
+```
+
+At this point `empty.h5` is a valid HDF5 file containing only the root group. For an external check, `h5dump -pBH empty.h5` reports `SUPERBLOCK_VERSION 2` and `GROUP "/" {}`.
 
 ## Acknowledgments
 
