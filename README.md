@@ -265,7 +265,8 @@ load lookup3
 First construct the version 2 superblock value. The root object header will start at offset `48#B`, and the final image size will be `179#B`:
 
 ```poke
-var undef_addr = u64_to_bytes_le (0xffffffffffffffffUL, 8)
+fun undef_addr = uint<8>[8]: { return uint<8>[8] (255); }
+
 var sb = superblock_v2 { sizeof_offsets = 8UB, sizeof_lengths = 8UB, ext_addr_raw = undef_addr, eof_addr_raw = u64_to_bytes_le (179UL, 8), root_obj_addr_raw = u64_to_bytes_le (48UL, 8) }
 ```
 
