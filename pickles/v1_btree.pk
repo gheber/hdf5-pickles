@@ -1,0 +1,295 @@
+/*
+ * v1_btree.pk - HDF5 Version 1 B-tree nodes and Symbol Table Nodes
+ *
+ * Covers:
+ *   - B-link Tree Node v1  (signature "TREE", Sec. III.A.1 of the HDF5 format spec)
+ *   - Symbol Table Node    (signature "SNOD", Sec. III.A.2)
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets,
+ *                                                global_sizeof_lengths, and
+ *                                           defines stab_ent (needed for snod)
+ *   (poke) .load pickles/ohdr.pk
+ *   (poke) .load pickles/btree.pk        <- load v1_btree.pk and v2_btree.pk
+ *
+ * NOTE: Before mapping a type-1 (raw data chunk) version 1 B-tree, 
+ *       set the dataset dimensionality:
+ *   (poke) set_bt1_ndims(n)              <- see comment for this function
+ *
+ * You can call print_recurse_v1_btree(<offset of v1 btree>, print_depth)
+ *  to print out the btree recursively
+ *
+ *  or 
+ *
+ * Do it manually by mapping the btree initially at its offset:
+ *   (poke) var bt1=v1_btree@<addr>#B
+ *
+ * then descend manually into each of its child pointers:
+ *   (poke) var jj=snod_node@<addr>#B     <- for node type 0 and node level 0,
+ *                                           map the symbol table node at the 
+ *                                           child pointer address
+ * 
+ * 
+ *
+ *      
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Global B-tree parameters
+ *
+ * These mirror the K values stored in the superblock.  They are not
+ * required for mapping (entries_used drives array sizing), but are useful
+ * for documentation and validation.
+ *
+ * Set after reading the superblock, e.g.:
+ *   (poke) set_bt1_leaf_k(sb.super.v0_v1.stab_leaf_k)
+ *   (poke) set_bt1_internal_k(sb.super.v0_v1.stab_internal_k)
+ *   (poke) set_bt1_indexed_internal_k(sb.super.v1.indexed_internal_k)   <- v1 superblock only 
+ * ----------------------------------------------------------------------- */
+
+//var global_bt1_print_depth = 0;    /* current recursion depth for print_recurse_v1_btree */
+
+var global_bt1_leaf_k              = 4UH;   /* stab_leaf_k from superblock              */
+var global_bt1_internal_k          = 16UH;  /* stab_internal_k from superblock          */
+var global_bt1_indexed_internal_k  = 32UH;  /* indexed_internal_k from superblock (v1)  */
+
+fun set_bt1_leaf_k = (uint<16> k) void:
+{
+    global_bt1_leaf_k = k;
+};
+
+fun set_bt1_internal_k = (uint<16> k) void:
+{
+    global_bt1_internal_k = k;
+};
+
+fun set_bt1_indexed_internal_k = (uint<16> k) void:
+{
+    global_bt1_indexed_internal_k = k;
+};
+
+/* Number of dimensions for the dataset indexed by a type-1 version 1 B-tree.
+ * Must be set before mapping v1_btree with node_type == 1. */
+var global_bt1_ndims = 1UB;
+
+/* n is the actual # of dimensions plus 1 to account for the datatype size as the last element */
+fun set_bt1_ndims = (uint<8> n) void:
+{
+    global_bt1_ndims = n;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Key types
+ * ----------------------------------------------------------------------- */
+
+/* Type-0 key: byte offset into the local heap's name space for the link name. */
+type bt1_key0 = struct {
+    byte[global_sizeof_lengths] name_off_raw;   /* Offset into local heap */
+};
+
+/* Type-1 key: describes a raw-data chunk.
+ *
+ * On disk: chunk_size, filter_mask, then global_bt1_ndims x uint<64>
+ * Note: the last uint<64> (trailing zero) is not present in the library coding */
+type bt1_key1 = struct {
+    uint<32> chunk_size;                            /* Bytes in the chunk (post-filter) */
+    uint<32> filter_mask;                           /* Bit i set -> filter i was skipped */
+    uint<64>[global_bt1_ndims] chunk_offsets;       /* Logical chunk position (0-based) */
+    //uint<64> trailing_zero == 0;                  /* Always 0 per spec (D+1 th field) */
+};
+
+/* Key/child pair types used inside the version 1 B-tree node body */
+type bt1_pair0 = struct {
+    bt1_key0              key;
+    byte[global_sizeof_offsets] child_raw;
+};
+
+type bt1_pair1 = struct {
+    bt1_key1              key;
+    byte[global_sizeof_offsets] child_raw;
+};
+
+/* ----------------------------------------------------------------------- *
+ * V1 B-tree (signature "TREE")
+ *
+ * On-disk key/child layout for the valid portion of the node:
+ *
+ *   K_0  C_0  K_1  C_1  ...  K_{n-1}  C_{n-1}  K_n
+ *
+ * where n = entries_used.  The unused capacity (up to 2K entries) that
+ * follows on disk is not mapped by this struct.
+ * ----------------------------------------------------------------------- */
+
+type v1_btree = struct {
+    byte[4]  signature == ['T', 'R', 'E', 'E'];
+    byte     node_type : node_type < 2;     /* 0 = group, 1 = raw-data chunk */
+    byte     node_level;                    /* 0 = leaf node                  */
+    uint<16> entries_used;                  /* Number of valid child pointers  */
+    byte[global_sizeof_offsets] left_sib_raw;   /* Left sibling (UNDEF_ADDR if leftmost)  */
+    byte[global_sizeof_offsets] right_sib_raw;  /* Right sibling (UNDEF_ADDR if rightmost) */
+
+    union {
+        /* ---- node_type 0: group (symbol table) ---- */
+        struct {
+            /* Interleaved (key, child) pairs for valid entries, then final key */
+            bt1_pair0[entries_used] pairs;
+            bt1_key0 final_key;
+        } type0 : node_type == 0;
+
+        /* ---- node_type 1: raw data chunks ---- */
+        struct {
+            bt1_pair1[entries_used] pairs;
+            bt1_key1 final_key;
+        } type1 : node_type == 1;
+
+        byte[6] unknown;
+
+    } body;
+
+};
+
+/* ----------------------------------------------------------------------- *
+ * Symbol Table Node  (signature "SNOD")
+ *
+ * Leaf nodes pointed to by type-0 B-tree child pointers.  Each child
+ * pointer from a type-0 B-tree leaf points to one of these nodes.
+ *
+ * stab_ent is defined in superblock.pk -- load that file first.
+ * The node holds between 0 and 2*stab_leaf_k entries; num_symbols
+ * indicates how many are valid.
+ * ----------------------------------------------------------------------- */
+
+type snod_node = struct {
+    byte[4]  signature == ['S', 'N', 'O', 'D'];
+    byte     version   == 1;
+    byte     res       == 0;
+    uint<16> num_symbols;               /* Number of valid symbol table entries */
+    stab_ent[num_symbols] entries;      /* Symbol table entries (defined in superblock.pk) */
+
+    method print_indented = (int depth) void:
+    {
+        indent(depth); printf("  snod_node {\n");
+        indent(depth); printf("    version=%v\n", version);
+        indent(depth); printf("    res=%v\n", res);
+        indent(depth); printf("    num_symbols=%v\n", num_symbols);
+        var n = 0UL;
+        /* Didn't add _print to stab_ent in superblock.pk */
+        while (n < num_symbols as uint<64>) {
+            indent(depth); printf("    entries[%v]=stab_ent {\n", n);
+            indent(depth); printf("      lnk_nm_off_raw=%v\n", entries[n].lnk_nm_off_raw);
+            indent(depth); printf("      ohdr_addr_raw=%v\n", entries[n].ohdr_addr_raw);
+            indent(depth); printf("      cache_type=%v\n", entries[n].cache_type);
+            indent(depth); printf("      res=%v\n", entries[n].res);
+            indent(depth); printf("      scratch_pad=struct {\n");
+
+            if (entries[n].cache_type == 1) {
+                indent(depth); printf("        obj_info=struct {\n");
+                indent(depth); printf("          btree_addr_raw=%v\n", entries[n].scratch_pad.obj_info.btree_addr_raw);
+                indent(depth); printf("          heap_addr_raw=%v\n", entries[n].scratch_pad.obj_info.heap_addr_raw);
+                indent(depth); printf("        }\n");
+                indent(depth); printf("      }\n");
+            } else if (entries[n].cache_type == 2) {
+                indent(depth); printf("        slink=%v\n", entries[n].scratch_pad.slink);
+            } else {
+                indent(depth); printf("        pad=%v\n", entries[n].scratch_pad.pad);
+            }
+            indent(depth); printf("      }\n");
+            indent(depth); printf("    }\n");
+            n = n + 1;
+        }
+        indent(depth); printf("  }\n");
+    }
+
+    method _print = void:
+    {
+        print_indented (1);
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Recursive B-tree printer
+ *
+ * Defined as a standalone function (not a method) so that v1_btree is
+ * already in scope and can be used with the @ mapping operator.
+ * snod is also defined above so that type-0 leaf children can be
+ * printed.
+ *
+ * Usage:
+ *   btree_print(some_off#B, 0)
+ * ----------------------------------------------------------------------- */
+fun print_recurse_v1_btree = (offset<uint<64>,B> off, int depth) void:
+{
+    var node = v1_btree @ off;
+    indent(depth); printf("\n");
+    indent(depth); printf("v1_btree {\n");
+    indent(depth); printf("  signature=%v\n", node.signature);
+    indent(depth); printf("  node_type=%v\n", node.node_type);
+    indent(depth); printf("  node_level=%v\n", node.node_level);
+    indent(depth); printf("  entries_used=%v\n", node.entries_used);
+    indent(depth); printf("  left_sib=%v\n", node.left_sib_raw);
+    indent(depth); printf("  right_sib=%v\n", node.right_sib_raw);
+    indent(depth); printf("  body=struct {\n");
+
+    var n = 0UL;
+    if (node.node_type == 0) {
+
+        if (node.entries_used)
+            indent(depth); printf("    type0=struct {\n");
+
+        while (n < node.entries_used as uint<64>) {
+            indent(depth); printf("      pairs=[bt1_pair0 {\n" );
+            indent(depth); printf("        key[%v]: key=bt1_key0 {\n", n);
+            indent(depth); printf("          name_off_raw=%v\n", node.body.type0.pairs[n].key.name_off_raw);
+            indent(depth); printf("        }\n"); /* closing bracket for btree_key0 */
+            indent(depth); printf("        child[%v]: child_raw=%v\n", n, node.body.type0.pairs[n].child_raw);
+
+            if (node.node_level > 0) {
+                print_recurse_v1_btree(bytes_to_off(node.body.type0.pairs[n].child_raw), depth + 3);
+            } else {
+                var snod = snod_node @ bytes_to_off(node.body.type0.pairs[n].child_raw);
+                indent(depth); printf("          child_raw==>\n");
+                snod.print_indented(depth+4);
+                indent(depth); printf("          <==child_raw\n");
+            }
+
+            indent(depth); printf("      }]\n" ); /* closing bracket for pairs */
+
+            n = n + 1;
+        }
+        indent(depth); printf("      key[%v]: final_key=bt1_key0 {\n", n );
+        indent(depth); printf("        name_off_raw=%v\n", node.body.type0.final_key.name_off_raw);
+        indent(depth); printf("      }\n");  /* closing bracket for final_key */
+
+        indent(depth); printf("    }\n"); /* closing bracket for type 0 */
+    } else {
+        if (node.entries_used)
+            indent(depth); printf("    type1=struct {\n");
+
+        while (n < node.entries_used as uint<64>) {
+            indent(depth); printf("      pairs=[bt1_pair1 {\n" );
+            indent(depth); printf("        key[%v]: key=bt1_key1 {\n", n);
+            indent(depth); printf("          chunk_size=%v\n", node.body.type1.pairs[n].key.chunk_size);
+            indent(depth); printf("          filter_mask=%v\n", node.body.type1.pairs[n].key.filter_mask);
+            indent(depth); printf("          offsets=%v\n", node.body.type1.pairs[n].key.chunk_offsets);
+            indent(depth); printf("        }\n"); /* btree_key1 */
+            indent(depth); printf("      child[%v]: child_raw=%v\n", n, node.body.type1.pairs[n].child_raw);
+
+            if (node.node_level > 0) {
+                print_recurse_v1_btree(bytes_to_off(node.body.type1.pairs[n].child_raw), depth + 3);
+            }
+            indent(depth); printf("      }]\n" ); /* closing bracket for pairs */
+
+            n = n + 1;
+        }
+        indent(depth); printf("      key[%v]: final_key=bt1_key1 {\n", n);
+        indent(depth); printf("        chunk_size=%v\n", node.body.type1.final_key.chunk_size);
+        indent(depth); printf("        filter_mask=%v\n", node.body.type1.final_key.filter_mask);
+        indent(depth); printf("        offsets=%v\n", node.body.type1.final_key.chunk_offsets);
+        indent(depth); printf("      }\n");  /* closing bracket for final_key */
+
+        indent(depth); printf("    }\n"); /* closing bracket for type 1 */
+    }
+    indent(depth); printf("  }\n"); /* closing bracket for body */
+    indent(depth); printf("}\n");   /* closing bracket for v1_btree */
+};
