@@ -26,9 +26,9 @@ type stab_ent = struct {
         struct {
             byte[global_sizeof_offsets] btree_addr_raw; /* Address of stab btree */
             byte[global_sizeof_offsets] heap_addr_raw;  /* Address of stab name heap */
-        }  stab: cache_type == 1;           /* Group object header metadata */
+        }  obj_info: cache_type == 1;           /* Group object header metadata */
 
-        uint<32> slink: cache_type == 2;    /* Symbolic link */
+        uint<32> slink: cache_type == 2;        /* Symbolic link */
         byte[16] pad: cache_type > 2 || cache_type == 0;       /* Scratch-pad space */
     } scratch_pad;
 };

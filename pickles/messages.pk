@@ -728,7 +728,7 @@ type H5O_msg_dtype =
 
             } opaque: ctype == 5;
 
-            /* compound: Not verified yet for v2??  and v3 */
+            /* compound: Not verified yet for v3 */
             struct {
                 var ff = hdr.flags;
                 var ss = hdr.elm_size;

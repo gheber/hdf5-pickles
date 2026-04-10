@@ -1,0 +1,711 @@
+/* v2_btree.pk - HDF5 Version 2 B-tree nodes  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Version 2 B-tree Header        (signature "BTHD", S.III.A.2)
+ *   - Version 2 B-tree Internal Node (signature "BTIN", S.III.A.2)
+ *   - Version 2 B-tree Leaf Node     (signature "BTLF", S.III.A.2)
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets and
+ *                                                global_sizeof_lengths
+ *   (poke) .load pickles/ohdr.pk
+ *   (poke) .load pickles/btree.pk >- loads v1_btree.pk v2_btree.pk
+ *
+ * Quick start:
+ *   1. Map the header at its file offset:
+ *        var hdr = v2_btree_hdr @ <addr>#B;
+ *      Mapping the header automatically sets global_bt2_type,
+ *      global_bt2_record_size, global_bt2_node_size, and
+ *      global_bt2_depth via constraint side-effects.
+ *
+ *   2. For chunk B-trees (type 10 or 11), set dataset dimensionality:
+ *        set_bt2_ndims(3UB)    <- for a 3-D dataset
+ *
+ *   2': print_v2_btree_hdr(hdr);  <- this will call functions to compute
+ *                                    the child-pointer field widths and
+ *                                    root record count, then it will 
+ *                                    call print_recurse_v2_btree() to 
+ *                                    print out the btree info recursively
+ *
+ *   OR <- you can do it manually: 
+ *
+ *   3. Map the root node.  If hdr.depth == 0 the root is a leaf:
+ *        set_bt2_nrec(hdr.num_root_records);
+ *        var root = v2_btree_leaf @ bytes_to_off(hdr.root_addr_raw);
+ *      If hdr.depth > 0 the root is an internal node:
+ *        set_bt2_nrec(hdr.num_root_records);
+ *        var root = v2_btree_internal @ bytes_to_off(hdr.root_addr_raw);
+ *
+ *   4. Records are decoded and printed automatically by _print according
+ *      to the node's record_type field.  To map individual records
+ *      directly, use the typed structs with @ at the desired offset:
+ *        var r = bt2_rec_type5 @ (leaf_offset + 6#B)
+ *      The first record starts at byte 6 of a leaf node (after the
+ *      4-byte signature, 1-byte version, and 1-byte type).
+ *
+ * Before mapping child nodes of an internal node, update globals:
+ *   set_bt2_nrec(bytes_to_u64_le(inode.children.d1[i].nrec_in_child_raw) as uint<16>);
+ *   set_bt2_depth(global_bt2_depth - 1);   <- decrement for each level down
+ *
+ * global_bt2_nrec_in_node_bytes and global_bt2_nrec_in_subtree_bytes
+ * control the widths of the record-count sub-fields in child pointers.
+ * The defaults (1 byte and 4 bytes respectively) cover most common HDF5
+ * files.  Use set_bt2_nrec_size_from_hdr() to auto-compute the node
+ * byte width using the internal-node formula (iterative convergence); use
+ * set_bt2_nrec_subtree_size_from_hdr() to auto-compute the subtree
+ * byte width per the spec's iterative level-by-level formula.
+ * 
+ * NOTE: to do the mapping manually (like from step #3 onwards) please be careful:
+ *  if global_bt2_nrec is changed after mapping root@internal,
+ *       then root will get ERROR; also wary about global_bt2_depth;  
+ *      (poke) set_bt2_nrec(hdr.num_root_records);
+ *      (poke) global_v2btree_nrec
+ *             1UH
+ *      (poke) var root = v2_btree_internal @ bytes_to_off(hdr.root_addr_raw);
+ *      (poke) root (succeed in printing out v2_btree_internal info
+ *      (poke) set_bt2_nrec(bytes_to_u64_le(root.children.d1[0].nrec_in_child_raw) as uint<16>);
+ *      (poke) global_bt2_depth
+ *             1UH
+ *      (poke) global_bt2_nrec
+ *             27UH
+ *      (poke) set_bt2_depth(global_bt2_depth - 1);
+ *             1
+ *      (poke) global_bt2_depth
+ *             0UH
+ *      (poke) root
+ *             unhandled constraint violation exception
+ *             no valid alternative in union
+ *
+ *      Because nrec got changed and also depth
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Global V2 B-tree parameters
+ * ----------------------------------------------------------------------- */
+
+var global_bt2_type        = 0UB;   /* Record type (from header)                  */
+var global_bt2_record_size = 0UH;   /* Size in bytes of each record               */
+var global_bt2_node_size   = 0U;    /* Size in bytes of each node                 */
+var global_bt2_depth       = 0UH;   /* B-tree depth (0 = root is a leaf)          */
+var global_bt2_nrec        = 0UH;   /* Records in the node being mapped           */
+var global_bt2_ndims       = 1UB;   /* Dataset chunk dimensions (types 10 / 11)     */
+
+/* Bytes used for the "nrec in child node" sub-field of each child pointer
+ * in an internal node.  Equals ceil(log256(max_records_per_node)).
+ * Default of 1 covers up to 255 records per node. */
+var global_bt2_nrec_in_node_bytes    = 1UB;
+
+/* Bytes used for the "nrec in child subtree" sub-field of each child
+ * pointer in internal nodes whose depth > 1.  Computed by
+ * set_bt2_nrec_subtree_size_from_hdr(); default of 4 covers up to
+ * ~4 billion total records. */
+var global_bt2_nrec_in_subtree_bytes = 4UB;
+
+fun set_bt2_type = (uint<8> t) int:
+{
+    global_bt2_type = t;
+    return 1;
+};
+
+fun set_bt2_record_size = (uint<16> sz) int:
+{
+    global_bt2_record_size = sz;
+    return 1;
+};
+
+fun set_bt2_node_size = (uint<32> sz) int:
+{
+    global_bt2_node_size = sz;
+    return 1;
+};
+
+fun set_bt2_depth = (uint<16> d) int:
+{
+    global_bt2_depth = d;
+    return 1;
+};
+
+fun set_bt2_nrec = (uint<16> n) void:
+{
+    global_bt2_nrec = n;
+};
+
+fun set_bt2_ndims = (uint<8> n) void:
+{
+    global_bt2_ndims = n;
+};
+
+fun set_bt2_nrec_in_node_bytes = (uint<8> sz) void:
+{
+    global_bt2_nrec_in_node_bytes = sz;
+};
+
+fun set_bt2_nrec_in_subtree_bytes = (uint<8> sz) void:
+{
+    global_bt2_nrec_in_subtree_bytes = sz;
+};
+
+/* Compute and set global_bt2_nrec_in_node_bytes.
+ *
+ * Uses the internal-node formula with iterative convergence to handle
+ * the circular dependency between child-pointer size and nrec_in_node_bytes.
+ *
+ * Internal node overhead: 4 sig + 1 ver + 1 type + 4 chksum = 10 bytes.
+ * An internal node holds N records and N+1 child pointers, so:
+ *
+ *   max_nrec = (node_size - 10 - ptr_size) / (record_size + ptr_size)
+ *
+ * where ptr_size = sizeof_offsets + nrec_in_node_bytes.  The depth-1
+ * pointer size (no subtree-count field) is used because it minimises
+ * ptr_size and therefore maximises max_nrec, giving the most conservative
+ * (largest) byte-width estimate.
+ *
+ * Call after mapping the header, e.g.:
+ *   set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+ */
+fun set_bt2_nrec_size_from_hdr = (uint<32> node_sz, uint<16> rec_sz) void:
+{
+    var bytes    = 1UB;
+    var prev     = 0UB;
+    var ptr_sz   = 0UL;
+    var max_nrec = 0UL;
+    var thresh   = 0UL;
+    while (bytes != prev) {
+        prev     = bytes;
+        ptr_sz   = (global_sizeof_offsets as uint<64>) + (bytes as uint<64>);
+        max_nrec = ((node_sz as uint<64>) - 10UL - ptr_sz) / ((rec_sz as uint<64>) + ptr_sz);
+        bytes    = 1UB;
+        thresh   = 256UL;
+        while (max_nrec >= thresh) {
+            bytes  = bytes + 1UB;
+            thresh = thresh * 256UL;
+        }
+    }
+    global_bt2_nrec_in_node_bytes = bytes;
+};
+
+/* Compute and set global_bt2_nrec_in_subtree_bytes.
+ *
+ * Implements the spec's iterative level-by-level formula:
+ *
+ *   cum_max[0]     = (node_sz - 10) / rec_sz          (max records in a leaf)
+ *   cum_max[level] = (max_int + 1) * cum_max[level-1] + max_int
+ *
+ * where max_int is the maximum records in an internal node at that level:
+ *
+ *   max_int = (node_sz - 10 - ptr_sz) / (rec_sz + ptr_sz)
+ *
+ * and ptr_sz = sizeof_offsets + nrec_in_node_bytes for level 1 (depth-1
+ * pointers carry no subtree field), or sizeof_offsets + nrec_in_node_bytes
+ * + subtree_bytes_from_previous_level for level > 1.
+ *
+ * The result is ceil(log256(cum_max[tree_depth - 1])), i.e. the minimum
+ * number of bytes needed to represent the maximum possible subtree record
+ * count for a child pointer at the root level.
+ *
+ * Must be called after set_bt2_nrec_size_from_hdr() so that
+ * global_bt2_nrec_in_node_bytes is already correct.  No-op when
+ * tree_depth <= 1 (subtree field is unused at those depths).
+ *
+ * Call after mapping the header, e.g.:
+ *   set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+ *   set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
+ */
+fun set_bt2_nrec_subtree_size_from_hdr = (uint<32> node_sz, uint<16> rec_sz, uint<16> tree_depth) void:
+{
+    var cum_max       = 0UL;
+    var nrec_node_sz  = 0UL;
+    var subtree_bytes = 1UL;
+    var level         = 0U;
+    var ptr_sz        = 0UL;
+    var max_int       = 0UL;
+    var thresh        = 0UL;
+
+    if (tree_depth > 1UH) {
+        /* Level 0: maximum records in a leaf node (10 bytes overhead, no ptrs) */
+        cum_max      = ((node_sz as uint<64>) - 10UL) / (rec_sz as uint<64>);
+        nrec_node_sz = global_bt2_nrec_in_node_bytes as uint<64>;
+        level        = 1U;
+        while (level < (tree_depth as uint<32>)) {
+            /* depth-1 pointers (level == 1, children are leaves) carry no
+             * subtree field; deeper pointers include the previous subtree_bytes */
+            ptr_sz = (global_sizeof_offsets as uint<64>) + nrec_node_sz;
+            if (level > 1U) {
+                ptr_sz = ptr_sz + subtree_bytes;
+            }
+            max_int = ((node_sz as uint<64>) - 10UL - ptr_sz) / ((rec_sz as uint<64>) + ptr_sz);
+            cum_max = (max_int + 1UL) * cum_max + max_int;
+            /* ceil(log256(cum_max)) */
+            subtree_bytes = 1UL;
+            thresh        = 256UL;
+            while (cum_max >= thresh) {
+                subtree_bytes = subtree_bytes + 1UL;
+                thresh        = thresh * 256UL;
+            }
+            level = level + 1U;
+        }
+        global_bt2_nrec_in_subtree_bytes = subtree_bytes as uint<8>;
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Version 2 B-tree Header  (signature "BTHD")
+ *
+ * Mapping this type automatically updates the global parameters via
+ * constraint side-effects, so subsequent node mappings pick up the
+ * correct values without additional setter calls.
+ * ----------------------------------------------------------------------- */
+
+type v2_btree_hdr = struct {
+    byte[4]  signature     == ['B', 'T', 'H', 'D'];
+    byte     version       == 0;
+    byte     record_type   : set_bt2_type(record_type);         /* B-tree record type        */
+    uint<32> node_size     : set_bt2_node_size(node_size);      /* Size of each node (bytes) */
+    uint<16> record_size   : set_bt2_record_size(record_size);  /* Record size (bytes)   */
+    uint<16> depth         : set_bt2_depth(depth);              /* 0 = root is a leaf        */
+    byte     split_percent;                                     /* Node split threshold      */
+    byte     merge_percent;                                     /* Node merge threshold      */
+    byte[global_sizeof_offsets] root_addr_raw;                  /* Root node file address    */
+    uint<16> num_root_records;                                  /* Records in root node      */
+    byte[global_sizeof_lengths] total_nrec_raw;                 /* Total records in B-tree   */
+    uint<32> chksum;                                            /* Checksum                  */
+
+    method _print = void:
+    {
+        printf("v2_btree_hdr {\n");
+        printf("  signature=%v\n",        signature);
+        printf("  version=%v\n",          version);
+        printf("  record_type=%v\n",      record_type);
+        printf("  node_size=%v\n",        node_size);
+        printf("  record_size=%v\n",      record_size);
+        printf("  depth=%v\n",            depth);
+        printf("  split_percent=%v\n",    split_percent);
+        printf("  merge_percent=%v\n",    merge_percent);
+        printf("  root_addr_raw=%v\n",    root_addr_raw);
+        printf("  num_root_records=%v\n", num_root_records);
+        printf("  total_nrec_raw=%v\n",   total_nrec_raw);
+        printf("  chksum=%v\n",           chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Record types
+ *
+ * Type 1  Indirectly accessed, non-filtered huge object (has unique ID)
+ * Type 2  Indirectly accessed, filtered huge object (has unique ID)
+ * Type 3  Directly accessed, non-filtered huge object (no ID field)
+ * Type 4  Directly accessed, filtered huge object (no ID field)
+ * Type 5  Link name in indexed group, name-ordered
+ * Type 6  Link name in indexed group, creation-order-indexed
+ * Type 7  Shared object header message (use bt2_raw_record)
+ * Type 8  Attribute name for indexed attributes (name-ordered)
+ * Type 9  Attribute creation order for indexed attributes
+ * Type 10 Non-filtered dataset chunk index
+ * Type 11 Filtered dataset chunk index
+ * ----------------------------------------------------------------------- */
+
+/* Type 1 - Indirectly accessed, non-filtered huge object
+ * Unlike type 3, this record is tracked in the heap and carries a
+ * unique object ID (L bytes, same width as sizeof_lengths).            */
+type bt2_rec_type1 = struct {
+    byte[global_sizeof_offsets] huge_obj_addr_raw;   /* Huge object file address    */
+    byte[global_sizeof_lengths] huge_obj_len_raw;    /* Huge object length in bytes */
+    byte[global_sizeof_lengths] huge_obj_id_raw;     /* Unique huge object ID       */
+};
+
+/* Type 2 - Indirectly accessed, filtered huge object
+ * Like type 1 but the stored data has been run through the filter
+ * pipeline; carries a unique object ID (L bytes).                      */
+type bt2_rec_type2 = struct {
+    byte[global_sizeof_offsets] huge_obj_addr_raw;      /* Huge object file address    */
+    byte[global_sizeof_lengths] huge_obj_len_raw;       /* Huge object length in bytes */
+    uint<32>                    filter_mask;             /* Filter pipeline mask        */
+    byte[global_sizeof_lengths] huge_obj_mem_size_raw;  /* Unfiltered size in bytes    */
+    byte[global_sizeof_lengths] huge_obj_id_raw;        /* Unique huge object ID       */
+};
+
+/* Type 3 - Directly accessed, non-filtered huge object
+ * The object is accessed directly by address; no heap tracking and
+ * therefore no unique object ID field.                                  */
+type bt2_rec_type3 = struct {
+    byte[global_sizeof_offsets] huge_obj_addr_raw;   /* Huge object file address    */
+    byte[global_sizeof_lengths] huge_obj_len_raw;    /* Huge object length in bytes */
+};
+
+/* Type 4 - Directly accessed, filtered huge object
+ * Like type 3 but with filter metadata; no unique object ID field.     */
+type bt2_rec_type4 = struct {
+    byte[global_sizeof_offsets] huge_obj_addr_raw;      /* Huge object file address    */
+    byte[global_sizeof_lengths] huge_obj_len_raw;       /* Huge object length in bytes */
+    uint<32>                    filter_mask;             /* Filter pipeline mask        */
+    byte[global_sizeof_lengths] huge_obj_mem_size_raw;  /* Unfiltered size in bytes    */
+};
+
+/* Type 5 - Link name, name-ordered
+ *
+ * The fractal heap object ID is always 7 bytes (spec S.III.A.2).        */
+type bt2_rec_type5 = struct {
+    uint<32> name_hash;     /* Hash of the link name                      */
+    byte[7]  heap_id_raw;   /* Fractal heap object ID (7 bytes)           */
+};
+
+/* Type 6 - Link name, creation-order-indexed
+ *
+ * The fractal heap object ID is always 7 bytes (spec S.III.A.2).        */
+type bt2_rec_type6 = struct {
+    uint<64> creation_order;   /* Link creation order value               */
+    byte[7]  heap_id_raw;      /* Fractal heap object ID (7 bytes)        */
+};
+
+/* Type 7, sub-type 0 - Shared message stored in the fractal heap       */
+type bt2_rec_type7_sub0 = struct {
+    uint<8>  message_location;   /* 0: message is in the fractal heap  */
+    uint<32> hash;               /* Hash of the message                */
+    uint<32> reference_count;    /* Number of objects sharing this msg */
+    byte[8]  heap_id_raw;        /* Fractal heap object ID             */
+};
+
+/* Type 7, sub-type 1 - Shared message stored in an object header       */
+type bt2_rec_type7_sub1 = struct {
+    uint<8>                     message_location;   /* 1: message is in an object header */
+    uint<32>                    hash;               /* Hash of the message               */
+    uint<8>                     message_type;       /* Type of the shared message        */
+    uint<16>                    obj_hdr_index;      /* Index of message in object header */
+    byte[global_sizeof_offsets] obj_hdr_addr_raw;   /* Object header file address        */
+};
+
+/* Type 8 - Attribute name for indexed attributes (name-ordered)         */
+type bt2_rec_type8 = struct {
+    byte[8]  heap_id_raw;     /* Fractal heap object ID for this attribute  */
+    uint<8>  message_flags;   /* Object header message flags                */
+    uint<32> creation_order;  /* Attribute creation order                   */
+    uint<32> name_hash;       /* Hash of the attribute name                 */
+};
+
+/* Type 9 - Attribute creation order for indexed attributes              */
+type bt2_rec_type9 = struct {
+    byte[8]  heap_id_raw;     /* Fractal heap object ID for this attribute  */
+    uint<8>  message_flags;   /* Object header message flags                */
+    uint<32> creation_order;  /* Attribute creation order                   */
+};
+
+/* Type 10 - Non-filtered dataset chunk index
+ *
+ * Set global_v2btree_ndims to the dataset's dimensionality before use.
+ * Address precedes the scaled offsets.                                  */
+type bt2_rec_type10 = struct {
+    byte[global_sizeof_offsets]    chunk_addr_raw;   /* Chunk data file address      */
+    uint<64>[global_bt2_ndims] scaled_offsets;   /* Scaled chunk position        */
+};
+
+/* Type 11 - Filtered dataset chunk index
+ *
+ * Like type 10 but with filter metadata.
+ * chunk_size_raw length is global_sizeof_lengths bytes.                */
+type bt2_rec_type11 = struct {
+    byte[global_sizeof_offsets]    chunk_addr_raw;   /* Chunk data file address      */
+    byte[global_sizeof_lengths]    chunk_size_raw;   /* Chunk size after filtering   */
+    uint<32>                       filter_mask;      /* Bit i set -> filter i skipped */
+    uint<64>[global_bt2_ndims]     scaled_offsets;   /* Scaled chunk position        */
+};
+
+/* Generic / fallback record - raw bytes.
+ * Used when the record type is unknown or unhandled.                   */
+type bt2_raw_record = struct {
+    byte[global_bt2_record_size] data;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Typed record printer
+ *
+ * Maps and prints the record at rec_off according to rtype.
+ * Call from within _print methods:
+ *   print_v2_btree_record_at(records[n]'offset as offset<uint<64>,B>, record_type);
+ * ----------------------------------------------------------------------- */
+
+fun print_v2_btree_record_at = (offset<uint<64>,B> rec_off, uint<8> rtype) void:
+{
+    if (rtype == 1UB) {
+        var r = bt2_rec_type1 @ rec_off;
+        printf("huge_obj_addr_raw=%v huge_obj_len_raw=%v huge_obj_id_raw=%v\n",
+               r.huge_obj_addr_raw, r.huge_obj_len_raw, r.huge_obj_id_raw);
+    } else if (rtype == 2UB) {
+        var r = bt2_rec_type2 @ rec_off;
+        printf("huge_obj_addr_raw=%v huge_obj_len_raw=%v filter_mask=%v huge_obj_mem_size_raw=%v huge_obj_id_raw=%v\n",
+               r.huge_obj_addr_raw, r.huge_obj_len_raw, r.filter_mask,
+               r.huge_obj_mem_size_raw, r.huge_obj_id_raw);
+    } else if (rtype == 3UB) {
+        var r = bt2_rec_type3 @ rec_off;
+        printf("huge_obj_addr_raw=%v huge_obj_len_raw=%v\n",
+               r.huge_obj_addr_raw, r.huge_obj_len_raw);
+    } else if (rtype == 4UB) {
+        var r = bt2_rec_type4 @ rec_off;
+        printf("huge_obj_addr_raw=%v huge_obj_len_raw=%v filter_mask=%v huge_obj_mem_size_raw=%v\n",
+               r.huge_obj_addr_raw, r.huge_obj_len_raw, r.filter_mask,
+               r.huge_obj_mem_size_raw);
+    } else if (rtype == 5UB) {
+        var r = bt2_rec_type5 @ rec_off;
+        printf("name_hash=0x%u32x heap_id_raw=%v\n", r.name_hash, r.heap_id_raw);
+    } else if (rtype == 6UB) {
+        var r = bt2_rec_type6 @ rec_off;
+        printf("creation_order=%v heap_id_raw=%v\n", r.creation_order, r.heap_id_raw);
+    } else if (rtype == 7UB) {
+        var loc = byte @ rec_off;
+        if (loc == 0UB) {
+            var r = bt2_rec_type7_sub0 @ rec_off;
+            printf("message_location=%v hash=0x%u32x reference_count=%v heap_id_raw=%v\n",
+                   r.message_location, r.hash, r.reference_count, r.heap_id_raw);
+        } else {
+            var r = bt2_rec_type7_sub1 @ rec_off;
+            printf("message_location=%v hash=0x%u32x message_type=%v obj_hdr_index=%v obj_hdr_addr_raw=%v\n",
+                   r.message_location, r.hash, r.message_type, r.obj_hdr_index, r.obj_hdr_addr_raw);
+        }
+    } else if (rtype == 8UB) {
+        var r = bt2_rec_type8 @ rec_off;
+        printf("heap_id_raw=%v message_flags=%v creation_order=%v name_hash=0x%u32x\n",
+               r.heap_id_raw, r.message_flags, r.creation_order, r.name_hash);
+    } else if (rtype == 9UB) {
+        var r = bt2_rec_type9 @ rec_off;
+        printf("heap_id_raw=%v message_flags=%v creation_order=%v\n",
+               r.heap_id_raw, r.message_flags, r.creation_order);
+    } else if (rtype == 10UB) {
+        var r = bt2_rec_type10 @ rec_off;
+        printf("chunk_addr_raw=%v scaled_offsets=%v\n", r.chunk_addr_raw, r.scaled_offsets);
+    } else if (rtype == 11UB) {
+        var r = bt2_rec_type11 @ rec_off;
+        printf("chunk_addr_raw=%v chunk_size_raw=%v filter_mask=%v scaled_offsets=%v\n",
+               r.chunk_addr_raw, r.chunk_size_raw, r.filter_mask, r.scaled_offsets);
+    } else {
+        var r = bt2_raw_record @ rec_off;
+        printf("data=%v\n", r.data);
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Child-pointer sub-structures for internal nodes
+ *
+ * Each of the (N + 1) child pointers in an internal node at depth D contains:
+ *   child_addr_raw      - file address of the child node
+ *   nrec_in_child_raw   - records stored directly in the child node
+ *                         (global_v2btree_nrec_in_node_bytes bytes)
+ *   nrec_in_subtree_raw - total records in the child's subtree, including
+ *                         all descendant nodes; present only when D > 1
+ *                         (global_v2btree_nrec_in_subtree_bytes bytes)
+ *
+ * Two types are provided, selected by the depth of the internal node
+ * being mapped:
+ *   v2_btree_child_ptr_d1  - for depth-1 nodes (direct parents of leaves)
+ *   v2_btree_child_ptr_dn  - for depth > 1 nodes
+ * ----------------------------------------------------------------------- */
+
+/* Child pointer in a depth-1 internal node (children are leaves)       */
+type bt2_child_ptr_d1 = struct {
+    byte[global_sizeof_offsets]              child_addr_raw;      /* Child node address    */
+    byte[global_bt2_nrec_in_node_bytes]  nrec_in_child_raw;  /* Records in child node */
+};
+
+/* Child pointer in a depth > 1 internal node                           */
+type bt2_child_ptr_dn = struct {
+    byte[global_sizeof_offsets]                  child_addr_raw;         /* Child node address       */
+    byte[global_bt2_nrec_in_node_bytes]      nrec_in_child_raw;      /* Records in child node    */
+    byte[global_bt2_nrec_in_subtree_bytes]   nrec_in_subtree_raw;    /* Records in subtree       */
+};
+
+/* ----------------------------------------------------------------------- *
+ * Version 2 B-tree Leaf Node  (signature "BTLF")
+ *
+ * Before mapping, set:
+ *   global_v2btree_record_size  (done automatically when header is mapped)
+ *   global_v2btree_nrec         (from parent's nrec_in_child_raw, or from
+ *                                 hdr.num_root_records for the root)
+ *
+ * Records are stored as raw bytes.  To decode them, use the appropriate
+ * typed record type with @ at the offset of records[0]:
+ *   (leaf_map_offset + 6#B) is the first record's address.
+ * ----------------------------------------------------------------------- */
+
+type v2_btree_leaf = struct {
+    byte[4] signature == ['B', 'T', 'L', 'F'];
+    byte    version   == 0;
+    byte    record_type;
+    bt2_raw_record[global_bt2_nrec] records;   /* All records in this leaf    */
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("v2_btree_leaf {\n");
+        printf("  signature=%v\n", signature);
+        printf("  version=%v\n",   version);
+        printf("  record_type=%v\n", record_type);
+        var n = 0UL;
+        while (n < global_bt2_nrec as uint<64>) {
+            printf("  records[%u64d]: ", n);
+            print_v2_btree_record_at(records[n]'offset as offset<uint<64>,B>, record_type);
+            n = n + 1UL;
+        }
+        printf("  chksum=%v\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Version 2 B-tree Internal Node  (signature "BTIN")
+ *
+ * Before mapping, set:
+ *   global_v2btree_record_size          (automatic from header)
+ *   global_v2btree_depth                (automatic from header; decrement
+ *                                         by 1 for each level descended)
+ *   global_v2btree_nrec                 (from parent or hdr.num_root_records)
+ *   global_v2btree_nrec_in_node_bytes   (default 1; adjust if node holds
+ *                                         more than 255 records)
+ *   global_v2btree_nrec_in_subtree_bytes (default 4; only used when depth > 1)
+ *
+ * The children union selects the correct child-pointer layout based on
+ * global_v2btree_depth at the time of mapping:
+ *   depth == 1  -> children.d1  (no subtree record count)
+ *   depth > 1   -> children.dn  (includes subtree record count)
+ * ----------------------------------------------------------------------- */
+
+type v2_btree_internal = struct {
+    byte[4] signature == ['B', 'T', 'I', 'N'];
+    byte    version   == 0;
+    byte    record_type;
+    bt2_raw_record[global_bt2_nrec] records;   /* Records in this node        */
+
+    union {
+        /* Direct parent of leaf nodes - no subtree record count           */
+        bt2_child_ptr_d1[global_bt2_nrec + 1] d1
+            : global_bt2_depth == 1;
+
+        /* Parent of internal nodes - includes subtree record count        */
+        bt2_child_ptr_dn[global_bt2_nrec + 1] dn
+            : global_bt2_depth > 1;
+    } children;
+
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("v2_btree_internal {\n");
+        printf("  signature=%v\n", signature);
+        printf("  version=%v\n",   version);
+        printf("  record_type=%v\n", record_type);
+        var n = 0UL;
+        while (n < global_bt2_nrec as uint<64>) {
+            printf("  records[%u64d]: ", n);
+            print_v2_btree_record_at(records[n]'offset as offset<uint<64>,B>, record_type);
+            n = n + 1UL;
+        }
+        var m = 0UL;
+        if (global_bt2_depth == 1) {
+            while (m < (global_bt2_nrec as uint<64>) + 1UL) {
+                printf("  children.d1[%v].child_addr_raw=%v\n",    m, children.d1[m].child_addr_raw);
+                printf("  children.d1[%v].nrec_in_child_raw=%v\n", m, children.d1[m].nrec_in_child_raw);
+                m = m + 1UL;
+            }
+        } else {
+            while (m < (global_bt2_nrec as uint<64>) + 1UL) {
+                printf("  children.dn[%v].child_addr_raw=%v\n",       m, children.dn[m].child_addr_raw);
+                printf("  children.dn[%v].nrec_in_child_raw=%v\n",    m, children.dn[m].nrec_in_child_raw);
+                printf("  children.dn[%v].nrec_in_subtree_raw=%v\n",  m, children.dn[m].nrec_in_subtree_raw);
+                m = m + 1UL;
+            }
+        }
+        printf("  chksum=%v\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Recursive B-tree printer
+ *
+ * Prints the full subtree rooted at the given file offset.  The globals
+ * must reflect the node being printed:
+ *   global_bt2_depth    - depth of this node (0 = leaf)
+ *   global_bt2_nrec     - records in this node
+ *   global_bt2_record_size, global_bt2_nrec_in_node_bytes,
+ *   global_bt2_nrec_in_subtree_bytes
+ *
+ * Prefer print_v2_btree(hdr) over calling this directly.
+ * ----------------------------------------------------------------------- */
+
+fun print_recurse_v2_btree = (offset<uint<64>,B> off) void:
+{
+    if (global_bt2_depth == 0) {
+
+        var leaf = v2_btree_leaf @ off;
+        leaf._print;
+
+    } else {
+
+        var saved_nrec  = global_bt2_nrec;   /* save before recursing */
+        var depth       = global_bt2_depth;
+        var inode       = v2_btree_internal @ off;
+        inode._print;
+
+        /* Recurse into each child */
+        var m = 0UL;
+        while (m < (saved_nrec as uint<64>) + 1UL) {
+            var child_off  = 0UL#B;
+            var child_nrec = 0UH;
+
+            if (depth == 1) {
+                child_off  = bytes_to_off(inode.children.d1[m].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.d1[m].nrec_in_child_raw) as uint<16>;
+            } else {
+                child_off  = bytes_to_off(inode.children.dn[m].child_addr_raw);
+                child_nrec = bytes_to_u64_le(inode.children.dn[m].nrec_in_child_raw) as uint<16>;
+            }
+
+            set_bt2_depth(depth - 1);
+            set_bt2_nrec(child_nrec);
+            print_recurse_v2_btree(child_off);
+
+            /* Restore depth and nrec for the next sibling */
+            set_bt2_depth(depth);
+            set_bt2_nrec(saved_nrec);
+            m = m + 1UL;
+        }
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Top-level B-tree printer
+ *
+ * Maps the header, computes field-width globals, then prints the full tree.
+ *
+ * Usage:
+ *   var hdr = v2_btree_hdr @ <offset>;
+ *   print_v2_btree(hdr);
+ * ----------------------------------------------------------------------- */
+
+fun print_v2_btree = (v2_btree_hdr hdr) void:
+{
+    /* Mapping hdr already called set_v2btree_type/node_size/record_size/depth
+     * via field constraints.  Compute the child-pointer field widths and
+     * root record count, then recurse. */
+    set_bt2_nrec_size_from_hdr(hdr.node_size, hdr.record_size);
+    set_bt2_nrec_subtree_size_from_hdr(hdr.node_size, hdr.record_size, hdr.depth);
+    set_bt2_nrec(hdr.num_root_records);
+    hdr._print;
+    print_recurse_v2_btree(bytes_to_off(hdr.root_addr_raw));
+};
