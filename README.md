@@ -4,16 +4,17 @@
 
 The goal is to describe HDF5 on-disk structures as executable binary format definitions that can be loaded in GNU poke to inspect, validate, and reason about HDF5 files.
 
-This repository is a work in progress. The current pickles focus on core HDF5 metadata structures, including the superblock, object headers, and related messages.
+This repository is a work in progress. The current pickles focus on core HDF5 metadata structures, including the superblock, B-trees, object headers, and related messages.
 
 ## Repository Layout
 
-- `pickles/common.pk`: shared helpers and common definitions
-- `pickles/superblock.pk`: HDF5 superblock definitions
-- `pickles/ohdr.pk`: object header definitions
-- `pickles/messages.pk`: object header message definitions
-- `pickles/construct.pk`: helpers for constructing version 2 metadata in memory
-- `pickles/lookup3.pk`: implementation of the lookup3 hash function used for checksums
+- [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions
+- [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions
+- [`pickles/btree.pk`](pickles/btree.pk): B-tree definitions
+- [`pickles/ohdr.pk`](pickles/ohdr.pk): object header definitions
+- [`pickles/messages.pk`](pickles/messages.pk): object header message definitions
+- [`pickles/lookup3.pk`](pickles/lookup3.pk): implementation of the lookup3 hash function used for checksums
+- [`pickles/construct.pk`](pickles/construct.pk): helpers for constructing version 2 metadata in memory
 
 ## Quick Tutorial
 
@@ -200,7 +201,144 @@ H5O_msg_layout {
 
 This shows the sort of machine-readable structure the pickles expose: dataspace, datatype, filter pipeline, and layout information are all decoded directly from the file.
 
-### 4. Inspect the available types
+### 4. Parse the chunk B-tree
+
+The dataset layout message above tells us where the chunk index lives:
+
+- `idx_addr_raw=[223UB,1UB,0UB,0UB,0UB,0UB,0UB,0UB]`
+- interpreted as a little-endian file offset, that is `479#B` (`0x1df`)
+
+In this sample file, the chunk index starts with the signature `TREE`, so it is a version 1 B-tree for raw-data chunks. Load the B-tree pickles, set the raw-chunk key dimensionality, and map the node:
+
+```poke
+load btree
+set_bt1_ndims (3UB)
+var bt = v1_btree @ 479#B
+bt
+```
+
+Why `3UB`? `v1_btree.pk` expects the raw-chunk key width to be the dataset dimensionality plus one. `file.h5` stores a 2-dimensional dataset (`8 x 8`), so the correct setting here is `2 + 1 = 3`.
+
+```text
+# Put these options in poke's config file (~/.pokerc) for prettier dumps of the B-tree nodes:
+.set pretty-print yes
+.set omode tree
+```
+
+Expected output (with options for readability):
+
+```text
+v1_btree {
+  signature=[84UB,82UB,69UB,69UB],
+  node_type=1UB,
+  node_level=0UB,
+  entries_used=4UH,
+  left_sib_raw=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB],
+  right_sib_raw=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB],
+  body=struct {
+    type1=struct {
+      pairs=[bt1_pair1 {
+        key=bt1_key1 {
+          chunk_size=64U,
+          filter_mask=1U,
+          chunk_offsets=[0UL,0UL,0UL]
+        },
+        child_raw=[183UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      },bt1_pair1 {
+        key=bt1_key1 {
+          chunk_size=40U,
+          filter_mask=0U,
+          chunk_offsets=[0UL,4UL,0UL]
+        },
+        child_raw=[63UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      },bt1_pair1 {
+        key=bt1_key1 {
+          chunk_size=40U,
+          filter_mask=0U,
+          chunk_offsets=[4UL,0UL,0UL]
+        },
+        child_raw=[103UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      },bt1_pair1 {
+        key=bt1_key1 {
+          chunk_size=40U,
+          filter_mask=0U,
+          chunk_offsets=[4UL,4UL,0UL]
+        },
+        child_raw=[143UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      }],
+      final_key=bt1_key1 {
+        chunk_size=0U,
+        filter_mask=0U,
+        chunk_offsets=[4UL,4UL,4UL]
+      }
+    }
+  }
+}
+```
+
+For a more readable dump, use the recursive printer:
+
+```poke
+print_recurse_v1_btree (479#B, 0)
+```
+
+This prints the four chunk records in `file.h5`. Since `node_level=0`, this root node is also a leaf, so there are no child B-tree nodes to descend into; each `child_raw` value is the file address of the chunk payload itself.
+
+Expected output (with options for readability):
+
+```text
+v1_btree {
+  signature=[84UB,82UB,69UB,69UB]
+  node_type=1UB
+  node_level=0UB
+  entries_used=4UH
+  left_sib=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB]
+  right_sib=[255UB,255UB,255UB,255UB,255UB,255UB,255UB,255UB]
+  body=struct {
+    type1=struct {
+      pairs=[bt1_pair1 {
+        key[0UL]: key=bt1_key1 {
+          chunk_size=64U
+          filter_mask=1U
+          offsets=[0UL,0UL,0UL]
+        }
+      child[0UL]: child_raw=[183UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      }]
+      pairs=[bt1_pair1 {
+        key[1UL]: key=bt1_key1 {
+          chunk_size=40U
+          filter_mask=0U
+          offsets=[0UL,4UL,0UL]
+        }
+      child[1UL]: child_raw=[63UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      }]
+      pairs=[bt1_pair1 {
+        key[2UL]: key=bt1_key1 {
+          chunk_size=40U
+          filter_mask=0U
+          offsets=[4UL,0UL,0UL]
+        }
+      child[2UL]: child_raw=[103UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      }]
+      pairs=[bt1_pair1 {
+        key[3UL]: key=bt1_key1 {
+          chunk_size=40U
+          filter_mask=0U
+          offsets=[4UL,4UL,0UL]
+        }
+      child[3UL]: child_raw=[143UB,12UB,0UB,0UB,0UB,0UB,0UB,0UB]
+      }]
+      key[4UL]: final_key=bt1_key1 {
+        chunk_size=0U
+        filter_mask=0U
+        offsets=[4UL,4UL,4UL]
+      }
+    }
+  }
+}
+```
+
+### 5. Inspect the available types
 
 You can also ask poke what each pickle defines:
 
@@ -211,7 +349,7 @@ You can also ask poke what each pickle defines:
 
 This is useful when extending the pickles or when you want to discover methods such as `get_messages ()` directly from the REPL.
 
-### 5. Try a write on a disposable copy
+### 6. Try a write on a disposable copy
 
 Poke maps are writable. To avoid modifying the sample file in the repository, make a copy first:
 
@@ -243,7 +381,7 @@ Expected output:
 
 This demonstrates byte-level write-through via the mapped pickle types. It does not automatically update higher-level HDF5 consistency metadata, so for real edits you may also need to recompute dependent fields such as checksums.
 
-### 6. Creating an "empty" HDF5 file
+### 7. Creating an "empty" HDF5 file
 
 We can also build a minimal HDF5 file from scratch: a version 2 superblock followed by a version 2 root object header for the root group. This time we construct the metadata in a memory-backed IOS first, and only save it to disk at the end.
 
