@@ -40,6 +40,7 @@ namespace {
 
 struct Marker {
     std::string name;
+    std::string description;
     std::string group;
     std::vector<std::uint8_t> bytes;
 };
@@ -96,32 +97,34 @@ class FileDescriptor {
 
 std::vector<Marker> build_markers() {
     return {
-        {"HDF5_SIGNATURE", "HDF5", {0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a}},
-        {"TREE", "HDF5", {'T', 'R', 'E', 'E'}},
-        {"BTHD", "HDF5", {'B', 'T', 'H', 'D'}},
-        {"BTIN", "HDF5", {'B', 'T', 'I', 'N'}},
-        {"BTLF", "HDF5", {'B', 'T', 'L', 'F'}},
-        {"SNOD", "HDF5", {'S', 'N', 'O', 'D'}},
-        {"HEAP", "HDF5", {'H', 'E', 'A', 'P'}},
-        {"GCOL", "HDF5", {'G', 'C', 'O', 'L'}},
-        {"FRHP", "HDF5", {'F', 'R', 'H', 'P'}},
-        {"FHDB", "HDF5", {'F', 'H', 'D', 'B'}},
-        {"FHIB", "HDF5", {'F', 'H', 'I', 'B'}},
-        {"FSHD", "HDF5", {'F', 'S', 'H', 'D'}},
-        {"FSSE", "HDF5", {'F', 'S', 'S', 'E'}},
-        {"SMTB", "HDF5", {'S', 'M', 'T', 'B'}},
-        {"SMLI", "HDF5", {'S', 'M', 'L', 'I'}},
-        {"OHDR", "HDF5", {'O', 'H', 'D', 'R'}},
-        {"OCHK", "HDF5", {'O', 'C', 'H', 'K'}},
-        {"FAHD", "HDF5", {'F', 'A', 'H', 'D'}},
-        {"FADB", "HDF5", {'F', 'A', 'D', 'B'}},
-        {"EAHD", "HDF5", {'E', 'A', 'H', 'D'}},
-        {"EAIB", "HDF5", {'E', 'A', 'I', 'B'}},
-        {"EASB", "HDF5", {'E', 'A', 'S', 'B'}},
-        {"EADB", "HDF5", {'E', 'A', 'D', 'B'}},
-        {"OHDH", "Onion", {'O', 'H', 'D', 'H'}},
-        {"OWHR", "Onion", {'O', 'W', 'H', 'R'}},
-        {"ORRS", "Onion", {'O', 'R', 'R', 'S'}},
+        {"HDF5_SIGNATURE", "HDF5 file signature", "HDF5",
+         {0x89, 0x48, 0x44, 0x46, 0x0d, 0x0a, 0x1a, 0x0a}},
+        {"TREE", "Version 1 B-tree node", "HDF5", {'T', 'R', 'E', 'E'}},
+        {"BTHD", "Version 2 B-tree header", "HDF5", {'B', 'T', 'H', 'D'}},
+        {"BTIN", "Version 2 B-tree internal node", "HDF5", {'B', 'T', 'I', 'N'}},
+        {"BTLF", "Version 2 B-tree leaf node", "HDF5", {'B', 'T', 'L', 'F'}},
+        {"SNOD", "Symbol table node", "HDF5", {'S', 'N', 'O', 'D'}},
+        {"HEAP", "Local heap", "HDF5", {'H', 'E', 'A', 'P'}},
+        {"GCOL", "Global heap collection", "HDF5", {'G', 'C', 'O', 'L'}},
+        {"FRHP", "Fractal heap header", "HDF5", {'F', 'R', 'H', 'P'}},
+        {"FHDB", "Fractal heap direct block", "HDF5", {'F', 'H', 'D', 'B'}},
+        {"FHIB", "Fractal heap indirect block", "HDF5", {'F', 'H', 'I', 'B'}},
+        {"FSHD", "Free-space manager header", "HDF5", {'F', 'S', 'H', 'D'}},
+        {"FSSE", "Free-space section information", "HDF5", {'F', 'S', 'S', 'E'}},
+        {"SMTB", "Shared Object Header Message table", "HDF5", {'S', 'M', 'T', 'B'}},
+        {"SMLI", "Shared message record list", "HDF5", {'S', 'M', 'L', 'I'}},
+        {"OHDR", "Version 2 object header", "HDF5", {'O', 'H', 'D', 'R'}},
+        {"OCHK", "Version 2 object header continuation block", "HDF5",
+         {'O', 'C', 'H', 'K'}},
+        {"FAHD", "Fixed Array header", "HDF5", {'F', 'A', 'H', 'D'}},
+        {"FADB", "Fixed Array data block", "HDF5", {'F', 'A', 'D', 'B'}},
+        {"EAHD", "Extensible Array header", "HDF5", {'E', 'A', 'H', 'D'}},
+        {"EAIB", "Extensible Array index block", "HDF5", {'E', 'A', 'I', 'B'}},
+        {"EASB", "Extensible Array secondary block", "HDF5", {'E', 'A', 'S', 'B'}},
+        {"EADB", "Extensible Array data block", "HDF5", {'E', 'A', 'D', 'B'}},
+        {"OHDH", "Onion History Data Header", "Onion", {'O', 'H', 'D', 'H'}},
+        {"OWHR", "Onion Whole-History Record", "Onion", {'O', 'W', 'H', 'R'}},
+        {"ORRS", "Onion Revision Record Signature", "Onion", {'O', 'R', 'R', 'S'}},
     };
 }
 
@@ -180,7 +183,7 @@ std::vector<std::string> known_groups() {
 
 void print_usage(std::ostream &out, const char *argv0) {
     out << "Usage:\n"
-        << "  " << argv0 << " --list-markers [FILE]\n"
+        << "  " << argv0 << " [--list-markers/-l] [FILE]\n"
         << "  " << argv0 << " [--threads/-j N] [--group GROUP] FILE\n"
         << "  " << argv0 << " --help\n"
         << "\n"
@@ -212,7 +215,7 @@ Options parse_options(int argc, char **argv) {
             continue;
         }
 
-        if (arg == "--list-markers") {
+        if (arg == "--list-markers" || arg == "-l") {
             options.list_markers = true;
             continue;
         }
@@ -256,7 +259,7 @@ Options parse_options(int argc, char **argv) {
     }
 
     if (!options.help && !options.list_markers && !options.file_path.has_value()) {
-        throw UsageError("an input file is required unless --list-markers is used");
+        throw UsageError("an input file is required unless --list-markers/-l is used");
     }
 
     return options;
@@ -280,6 +283,7 @@ void list_markers(std::ostream &out, const std::optional<std::string> &group_fil
     out << "Markers defined in the HDF5 and Onion formats:\n\n";
 
     std::string current_group;
+    const std::size_t col_width = max_marker_name_width();
     for (const auto &marker : markers()) {
         if (group_filter.has_value() && marker.group != *group_filter) {
             continue;
@@ -290,7 +294,9 @@ void list_markers(std::ostream &out, const std::optional<std::string> &group_fil
             out << current_group << ":\n";
         }
 
-        out << "  " << marker.name;
+        out << "  " << std::left << std::setfill(' ')
+            << std::setw(static_cast<int>(col_width)) << marker.name
+            << "  " << marker.description;
 
         const bool has_non_ascii = std::any_of(marker.bytes.begin(), marker.bytes.end(),
             [](std::uint8_t b) { return b < 0x20 || b > 0x7e; });
