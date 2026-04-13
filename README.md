@@ -18,7 +18,9 @@ This repository is a work in progress. The current pickles focus on core HDF5 me
 
 ## Marker Scanner
 
-`marker_scan` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). It can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
+`marker_scan` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
+
+`marker_scan` can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
 
 Build:
 
