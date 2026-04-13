@@ -6,7 +6,7 @@ The goal is to describe HDF5 on-disk structures as executable binary format defi
 
 This repository is a work in progress. The current pickles focus on core HDF5 metadata structures, including the superblock, B-trees, object headers, and related messages.
 
-## Repository Layout
+## Repository Layout - Pickles
 
 - [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions
 - [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions
@@ -15,6 +15,52 @@ This repository is a work in progress. The current pickles focus on core HDF5 me
 - [`pickles/messages.pk`](pickles/messages.pk): object header message definitions
 - [`pickles/lookup3.pk`](pickles/lookup3.pk): implementation of the lookup3 hash function used for checksums
 - [`pickles/construct.pk`](pickles/construct.pk): helpers for constructing version 2 metadata in memory
+
+## Marker Scanner
+
+`marker_scan` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
+
+`marker_scan` can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
+
+Build:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+Usage:
+
+```bash
+# List all known markers
+build/marker_scan --list-markers
+
+# Scan a file with the default thread count
+build/marker_scan path/to/file.h5
+
+# Scan with an explicit thread count (-j is a synonym for --threads)
+build/marker_scan --threads 8 path/to/file.h5.onion
+build/marker_scan -j 8 path/to/file.h5.onion
+
+# Restrict the scan (and listing) to one group of markers
+build/marker_scan --group HDF5 path/to/file.h5
+build/marker_scan --group Onion --list-markers path/to/file.h5.onion
+
+# Show usage
+build/marker_scan --help
+```
+
+The scanner prints one line per detected marker with the marker name and its file offset in both
+hexadecimal and decimal. Progress is reported on stderr when scanning in a terminal.
+
+For example, scanning the sample file `file.h5` in this repository produces the following output:
+
+```text
+HDF5_SIGNATURE  0x0000000000000000 (0)                      
+OHDR            0x0000000000000030 (48)
+OHDR            0x00000000000000C3 (195)
+TREE            0x00000000000001DF (479)
+```
 
 ## Quick Tutorial
 
