@@ -29,25 +29,31 @@
  *   (poke) .load pickles/ohdr.pk
  *   (poke) .load pickles/btree.pk        <- load v1_btree.pk and v2_btree.pk
  *
- * NOTE: Before mapping a type-1 (raw data chunk) version 1 B-tree, 
- *       set the dataset dimensionality:
- *   (poke) set_bt1_ndims(n)              <- see comment for this function
+ * Quick start:
+ *   1. Before mapping a type-1 (raw data chunk) version 1 B-tree, 
+ *      set the dataset dimensionality:
+ *          (poke) set_bt1_ndims(n)              <- see comment for this function
  *
- * You can call print_recurse_v1_btree(<offset of v1 btree>, print_depth)
- *  to print out the btree recursively
+ *   2. print_v1_btree(<addr>#B, print_depth);   <- to print out the btree recursively
+ *                                 
  *
- *  or 
+ *   OR <- you can do it manually:   
  *
- * Do it manually by mapping the btree initially at its offset:
- *   (poke) var bt1=v1_btree@<addr>#B
+ *   1. Map the btree node initially at its offset:
+ *      (poke) var bt1=v1_btree@<addr>#B
  *
- * then descend manually into each of its child pointers:
- *   (poke) var jj=snod_node@<addr>#B     <- for node type 0 and node level 0,
- *                                           map the symbol table node at the 
- *                                           child pointer address
- * 
- * 
+ *   2. Before mapping a type-1 (raw data chunk) version 1 B-tree, 
+ *      set the dataset dimensionality:
+ *          (poke) set_bt1_ndims(n)              <- see comment for this function
  *
+ *   3. Descend manually into each of its child pointers:
+ *          (poke) var jj=snod_node@<addr>#B     <- for node type 0 and node level 0,
+ *                                                  map the symbol table node at the
+ *                                                  child pointer address
+ *      OR
+ *          (poke) var jj=v1_btree@<addr>#B      <- for node type 1 and nonzero node level, 
+ *                                                  descend into the subtree by mapping at
+ *                                                  the child pointer address
  *      
  */
 
@@ -63,8 +69,6 @@
  *   (poke) set_bt1_internal_k(sb.super.v0_v1.stab_internal_k)
  *   (poke) set_bt1_indexed_internal_k(sb.super.v1.indexed_internal_k)   <- v1 superblock only 
  * ----------------------------------------------------------------------- */
-
-//var global_bt1_print_depth = 0;    /* current recursion depth for print_recurse_v1_btree */
 
 var global_bt1_leaf_k              = 4UH;   /* stab_leaf_k from superblock              */
 var global_bt1_internal_k          = 16UH;  /* stab_internal_k from superblock          */
@@ -232,9 +236,9 @@ type snod_node = struct {
  * printed.
  *
  * Usage:
- *   btree_print(some_off#B, 0)
+ *   print_v1_btree(some_off#B, 0)
  * ----------------------------------------------------------------------- */
-fun print_recurse_v1_btree = (offset<uint<64>,B> off, int depth) void:
+fun print_v1_btree = (offset<uint<64>,B> off, int depth) void:
 {
     var node = v1_btree @ off;
     indent(depth); printf("\n");
@@ -261,7 +265,7 @@ fun print_recurse_v1_btree = (offset<uint<64>,B> off, int depth) void:
             indent(depth); printf("        child[%v]: child_raw=%v\n", n, node.body.type0.pairs[n].child_raw);
 
             if (node.node_level > 0) {
-                print_recurse_v1_btree(bytes_to_off(node.body.type0.pairs[n].child_raw), depth + 3);
+                print_v1_btree(bytes_to_off(node.body.type0.pairs[n].child_raw), depth + 3);
             } else {
                 var snod = snod_node @ bytes_to_off(node.body.type0.pairs[n].child_raw);
                 indent(depth); printf("          child_raw==>\n");
@@ -292,7 +296,7 @@ fun print_recurse_v1_btree = (offset<uint<64>,B> off, int depth) void:
             indent(depth); printf("      child[%v]: child_raw=%v\n", n, node.body.type1.pairs[n].child_raw);
 
             if (node.node_level > 0) {
-                print_recurse_v1_btree(bytes_to_off(node.body.type1.pairs[n].child_raw), depth + 3);
+                print_v1_btree(bytes_to_off(node.body.type1.pairs[n].child_raw), depth + 3);
             }
             indent(depth); printf("      }]\n" ); /* closing bracket for pairs */
 

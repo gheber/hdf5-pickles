@@ -1,0 +1,753 @@
+/* earray.pk - HDF5 Extensible Array chunk index.  */
+
+/* Copyright (C) 2026 The HDF Group.  */
+
+/* This program is free software: you can redistribute it and/or modify
+ * it under the terms of the GNU General Public License as published by
+ * the Free Software Foundation, either version 3 of the License, or
+ * (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ * but WITHOUT ANY WARRANTY; without even the implied warranty of
+ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ * GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ * along with this program.  If not, see <http://www.gnu.org/licenses/>.
+ */
+
+/*
+ * Covers:
+ *   - Extensible Array Header      (signature "EAHD", Appendix C.IV of the
+ *                                   HDF5 format spec v3)
+ *   - Extensible Array Index Block (signature "EAIB", Appendix C.IV)
+ *   - Extensible Array Secondary Block (signature "EASB", Appendix C.IV)
+ *   - Extensible Array Data Block  (signature "EADB", Appendix C.IV)
+ *   - Extensible Array Data Block Page (no signature; sequentially appended
+ *                                   to a paged data block)
+ *
+ * Load order:
+ *   (poke) .load pickles/common.pk
+ *   (poke) .load pickles/superblock.pk   <- sets global_sizeof_offsets and
+ *                                                global_sizeof_lengths
+ *   (poke) .load pickles/ohdr.pk
+ *   (poke) .load pickles/earray.pk
+ *
+ * Quick start:
+ *
+ *   print_ea(<addr>#B);               <- maps the Extensible Array header at
+ *                                        the given file offset, prints it and
+ *                                        the index block, then recursively
+ *                                        prints all reachable data blocks and
+ *                                        secondary blocks (skipping HADDR_UNDEF
+ *                                        entries).
+ *
+ *   OR -- manual step-by-step:
+ *
+ *   1. Map the header:
+ *        var hdr = ea_hdr @ <addr>#B;
+ *      Mapping the header automatically sets all global_ea_* variables via
+ *      constraint side-effects.
+ *
+ *   2. Map the index block:
+ *        var ib = ea_iblock @ bytes_to_off(hdr.idx_blk_addr_raw);
+ *
+ *   3a. For a direct data block (sblk index u, element count n):
+ *        set_ea_dblock(n);
+ *        var db = ea_dblock @ <addr>#B;
+ *
+ *   3b. For a secondary block (sblk index u):
+ *        set_ea_sblock_idx(u);
+ *        var sb = ea_sblock @ <addr>#B;
+ *
+ *   4. For a data block page (after a paged data block prefix):
+ *        var pg = ea_dblk_page @ <page_offset>#B;
+ *
+ * Extensible Array structure overview:
+ *
+ *   The Extensible Array (EA) indexes chunks in datasets with exactly one
+ *   unlimited dimension.  It uses a multi-level scheme:
+ *
+ *     Header -> Index Block -> {direct data blocks,
+ *                              Secondary Blocks -> Data Blocks}
+ *                                               v (when paged)
+ *                                            Data Block Pages
+ *
+ *   Data blocks are partitioned into "secondary block groups" indexed by u:
+ *     - ndblks[u]      = 2^(u/2)            (integer division)
+ *     - dblk_nelmts[u] = 2^((u+1)/2) * min  (min = data_blk_min_elmts)
+ *
+ *   The first iblk_nsblks secondary block groups have their data block addresses
+ *   stored directly in the index block (dblk_addrs[]).  The remaining secondary
+ *   block groups are managed through separate secondary block structures whose
+ *   addresses are stored in sblk_addrs[] of the index block.
+ *
+ *   Derived counts (set when the header is mapped):
+ *     iblk_nsblks  = 2 * log2(sup_blk_min_data_ptrs)
+ *     ndblk_addrs  = 2 * (sup_blk_min_data_ptrs - 1)
+ *     nsblks       = 1 + (max_nelmts_bits - log2(data_blk_min_elmts))
+ *     nsblk_addrs  = nsblks - iblk_nsblks
+ *     arr_off_size = ceil(max_nelmts_bits / 8)
+ *
+ * Client IDs:
+ *   0  H5EA_CLS_CHUNK_ID      Non-filtered dataset chunk addresses.
+ *                             Each element is sizeof_offsets bytes (address).
+ *   1  H5EA_CLS_FILT_CHUNK_ID Filtered dataset chunk addresses.
+ *                             Each element is:
+ *                               chunk address  (sizeof_offsets bytes)
+ *                               filtered size  (raw_elmt_size - sizeof_offsets
+ *                                               - 4 bytes)
+ *                               filter mask    (4 bytes, uint<32>)
+ *
+ * Paging (data blocks):
+ *   When dblk_nelmts[u] > dblk_page_nelmts (= 2^max_dblk_page_nelmts_bits),
+ *   a data block for that secondary block group stores only a prefix on disk;
+ *   elements are stored in separate data block pages that immediately follow
+ *   the prefix.  Each page holds dblk_page_nelmts elements plus a 4-byte
+ *   checksum.
+ *
+ *   The secondary block records a per-data-block page-init bitmask
+ *   (dblk_page_init_size bytes per data block) immediately before its
+ *   data block address table.
+ */
+
+/* ----------------------------------------------------------------------- *
+ * Global Extensible Array parameters
+ *
+ * Set automatically when ea_hdr is mapped.  Additional per-secondary-block and
+ * per-data-block globals are set by set_ea_sblock_idx() and set_ea_dblock()
+ * before mapping the corresponding structures.
+ * ----------------------------------------------------------------------- */
+
+var global_ea_client_id                  = 0UB; /* 0=non-filtered, 1=filtered  */
+var global_ea_raw_elmt_size              = 0UB; /* On-disk bytes per element   */
+var global_ea_max_nelmts_bits            = 0UB; /* log2(max # of elements)     */
+var global_ea_idx_blk_elmts              = 0UB; /* Elements in index block     */
+var global_ea_data_blk_min_elmts         = 0UB; /* Min elements per data block */
+var global_ea_sup_blk_min_data_ptrs      = 0UB; /* Min data ptrs per sblock    */
+var global_ea_max_dblk_page_nelmts_bits  = 0UB; /* log2(max elts per db page)  */
+
+var global_ea_arr_off_size               = 0UB; /* ceil(max_nelmts_bits / 8)   */
+var global_ea_nsblks                     = 0UL; /* Total secondary block count     */
+var global_ea_iblk_nsblks                = 0UL; /* Sblks with dblk_addrs in ib */
+var global_ea_ndblk_addrs                = 0UL; /* Dblk addrs in index block   */
+var global_ea_nsblk_addrs                = 0UL; /* Sblk addrs in index block   */
+var global_ea_dblk_page_nelmts           = 0UL; /* Elements per db page        */
+var global_ea_chunk_size_len             = 0UB; /* Bytes for filtered chunk sz */
+
+/* Per-super-block globals -- set by set_ea_sblock_idx() before ea_sblock.  */
+var global_ea_sblk_idx                   = 0UL; /* Secondary block index u         */
+var global_ea_sblk_ndblks                = 0UL; /* Data blocks in this sblock  */
+var global_ea_sblk_dblk_nelmts           = 0UL; /* Elements per dblock in sblk */
+var global_ea_sblk_dblk_npages           = 0UL; /* Pages per dblock (0=none)   */
+var global_ea_sblk_dblk_page_init_size   = 0UL; /* Page-init bytes per dblock  */
+var global_ea_sblk_total_page_init_size  = 0UL; /* ndblks * page_init_size     */
+
+/* Per-data-block globals -- set by set_ea_dblock() before ea_dblock.       */
+var global_ea_dblk_nelmts                = 0UL; /* Elements in this data block */
+var global_ea_dblk_npages                = 0UL; /* Pages in this dblock (0=no) */
+
+/* ----------------------------------------------------------------------- *
+ * Helper: integer log2 for power-of-2 values
+ * ----------------------------------------------------------------------- */
+
+fun ea_log2_pow2 = (uint<64> n) uint<64>:
+{
+    var bits = 0UL;
+    var v    = n;
+    while (v > 1UL) {
+        v    = v .>> 1UL;
+        bits = bits + 1UL;
+    }
+    return bits;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Setter functions -- called via field constraints when ea_hdr is mapped
+ * ----------------------------------------------------------------------- */
+
+fun set_ea_client_id = (uint<8> id) int:
+{
+    global_ea_client_id = id;
+    return 1;
+};
+
+fun set_ea_raw_elmt_size = (uint<8> sz) int:
+{
+    global_ea_raw_elmt_size = sz;
+    var off_sz = global_sizeof_offsets as uint<8>;
+    if (sz > off_sz + 4UB)
+        global_ea_chunk_size_len = sz - off_sz - 4UB;
+    else
+        global_ea_chunk_size_len = 0UB;
+    return 1;
+};
+
+fun set_ea_max_nelmts_bits = (uint<8> bits) int:
+{
+    global_ea_max_nelmts_bits = bits;
+    /* arr_off_size = ceil(max_nelmts_bits / 8)                             */
+    global_ea_arr_off_size =
+        ((bits as uint<64> + 7UL) / 8UL) as uint<8>;
+    return 1;
+};
+
+fun set_ea_idx_blk_elmts = (uint<8> n) int:
+{
+    global_ea_idx_blk_elmts = n;
+    return 1;
+};
+
+fun set_ea_data_blk_min_elmts = (uint<8> min_elmts) int:
+{
+    global_ea_data_blk_min_elmts = min_elmts;
+    /* nsblks = 1 + (max_nelmts_bits - log2(data_blk_min_elmts))           */
+    global_ea_nsblks =
+        1UL
+        + (global_ea_max_nelmts_bits as uint<64>)
+        - ea_log2_pow2(min_elmts as uint<64>);
+    return 1;
+};
+
+fun set_ea_sup_blk_min_data_ptrs = (uint<8> m) int:
+{
+    global_ea_sup_blk_min_data_ptrs = m;
+    /* iblk_nsblks = H5EA_SBLK_FIRST_IDX(m) = 2 * log2(m)                 */
+    global_ea_iblk_nsblks  = 2UL * ea_log2_pow2(m as uint<64>);
+    /* ndblk_addrs = 2 * (m - 1)                                           */
+    global_ea_ndblk_addrs  = 2UL * ((m as uint<64>) - 1UL);
+    /* nsblk_addrs = total nsblks - sblks already covered by dblk_addrs    */
+    global_ea_nsblk_addrs  = global_ea_nsblks - global_ea_iblk_nsblks;
+    return 1;
+};
+
+fun set_ea_max_dblk_page_nelmts_bits = (uint<8> bits) int:
+{
+    global_ea_max_dblk_page_nelmts_bits = bits;
+    if (bits > 0UB)
+        global_ea_dblk_page_nelmts = 1UL <<. (bits as uint<64>);
+    else
+        global_ea_dblk_page_nelmts = 0UL;
+    return 1;
+};
+
+/* ----------------------------------------------------------------------- *
+ * set_ea_sblock_idx -- derive per-secondary-block globals from the sblock index
+ *
+ * Must be called before mapping ea_sblock.
+ *
+ *   ndblks[u]      = 2^(u/2)            (H5_EXP2(u / 2))
+ *   dblk_nelmts[u] = 2^((u+1)/2) * min  (H5EA_SBLK_DBLK_NELMTS(u, min))
+ * ----------------------------------------------------------------------- */
+
+fun set_ea_sblock_idx = (uint<64> sblk_idx) void:
+{
+    global_ea_sblk_idx       = sblk_idx;
+    global_ea_sblk_ndblks    = 1UL <<. (sblk_idx / 2UL);
+    global_ea_sblk_dblk_nelmts =
+        (1UL <<. ((sblk_idx + 1UL) / 2UL))
+        * (global_ea_data_blk_min_elmts as uint<64>);
+
+    if (global_ea_dblk_page_nelmts > 0UL
+        && global_ea_sblk_dblk_nelmts > global_ea_dblk_page_nelmts) {
+        global_ea_sblk_dblk_npages =
+            global_ea_sblk_dblk_nelmts / global_ea_dblk_page_nelmts;
+        global_ea_sblk_dblk_page_init_size =
+            (global_ea_sblk_dblk_npages + 7UL) / 8UL;
+    } else {
+        global_ea_sblk_dblk_npages         = 0UL;
+        global_ea_sblk_dblk_page_init_size = 0UL;
+    }
+
+    global_ea_sblk_total_page_init_size =
+        global_ea_sblk_ndblks * global_ea_sblk_dblk_page_init_size;
+};
+
+/* ----------------------------------------------------------------------- *
+ * set_ea_dblock -- set per-data-block globals before mapping ea_dblock
+ *
+ * nelmts: number of elements in the data block to be mapped.
+ * ----------------------------------------------------------------------- */
+
+fun set_ea_dblock = (uint<64> nelmts) void:
+{
+    global_ea_dblk_nelmts = nelmts;
+    if (global_ea_dblk_page_nelmts > 0UL
+        && nelmts > global_ea_dblk_page_nelmts)
+        global_ea_dblk_npages = nelmts / global_ea_dblk_page_nelmts;
+    else
+        global_ea_dblk_npages = 0UL;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Helper: return 1 if all bytes of an address are 0xFF (HADDR_UNDEF)
+ * ----------------------------------------------------------------------- */
+
+fun ea_is_undef_addr = (byte[] raw) int:
+{
+    for (b in raw) {
+        if (b != 0xFFUB) return 0;
+    }
+    return 1;
+};
+
+/* ----------------------------------------------------------------------- *
+ * Element types
+ *
+ * Client ID 0 -- non-filtered chunk: sizeof_offsets-byte file address.
+ * Client ID 1 -- filtered chunk: address + filtered size + filter mask.
+ *
+ * Set global_ea_client_id and global_ea_chunk_size_len (via header mapping)
+ * before using ea_element.
+ * ----------------------------------------------------------------------- */
+
+type ea_chunk_elem = struct {
+    byte[global_sizeof_offsets] addr_raw;
+};
+
+type ea_filt_chunk_elem = struct {
+    byte[global_sizeof_offsets]    addr_raw;
+    byte[global_ea_chunk_size_len] chunk_size_raw;
+    uint<32>                       filter_mask;
+};
+
+/* According to format spec: only two element types: non_filtered and filtered;
+ * "testing" type is added just for testing with the earray test files: 1st_earray.h5 and 2nd_earray.h5 */
+type ea_element = union {
+    ea_chunk_elem      non_filtered : (global_ea_client_id == 0UB);
+    ea_filt_chunk_elem filtered     : (global_ea_client_id == 1UB);
+    ea_chunk_elem      testing: (global_ea_client_id == 2UB);
+};
+
+/* ----------------------------------------------------------------------- *
+ * Extensible Array Header  (signature "EAHD")
+ *
+ * Mapping this type automatically updates all global_ea_* parameters via
+ * constraint side-effects, so subsequent structure mappings will use the
+ * correct values without additional setter calls.
+ *
+ * On-disk layout (field order matches H5EA__cache_hdr_serialize):
+ *   [sig:4][ver:1][client_id:1][raw_elmt_size:1][max_nelmts_bits:1]
+ *   [idx_blk_elmts:1][data_blk_min_elmts:1][sup_blk_min_data_ptrs:1]
+ *   [max_dblk_page_nelmts_bits:1]
+ *   [nsuper_blks:L][super_blk_size:L][ndata_blks:L][data_blk_size:L]
+ *   [max_idx_set:L][nelmts:L]
+ *   [idx_blk_addr:O][chksum:4]
+ * where L = sizeof_lengths, O = sizeof_offsets.
+ * ----------------------------------------------------------------------- */
+
+type ea_hdr = struct {
+    byte[4] signature              == ['E','A','H','D'];
+    byte    version                == 0;
+    byte    client_id                  : set_ea_client_id(client_id);
+    byte    raw_elmt_size              : set_ea_raw_elmt_size(raw_elmt_size);
+    byte    max_nelmts_bits            : set_ea_max_nelmts_bits(max_nelmts_bits);
+    byte    idx_blk_elmts              : set_ea_idx_blk_elmts(idx_blk_elmts);
+    byte    data_blk_min_elmts         : set_ea_data_blk_min_elmts(data_blk_min_elmts);
+    byte    sup_blk_min_data_ptrs      : set_ea_sup_blk_min_data_ptrs(sup_blk_min_data_ptrs);
+    byte    max_dblk_page_nelmts_bits  : set_ea_max_dblk_page_nelmts_bits(max_dblk_page_nelmts_bits);
+    /* Statistics -- 6 fields of sizeof_lengths bytes each                  */
+    byte[global_sizeof_lengths] nsuper_blks_raw;
+    byte[global_sizeof_lengths] super_blk_size_raw;
+    byte[global_sizeof_lengths] ndata_blks_raw;
+    byte[global_sizeof_lengths] data_blk_size_raw;
+    byte[global_sizeof_lengths] max_idx_set_raw;
+    byte[global_sizeof_lengths] nelmts_raw;
+    /* File address of the index block                                      */
+    byte[global_sizeof_offsets] idx_blk_addr_raw;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("ea_hdr {\n");
+        printf("  signature=%v\n",                      signature);
+        printf("  version=%u8d\n",                       version);
+        printf("  client_id=%u8d\n",                      client_id);
+        printf("  raw_elmt_size=%u8d\n",                raw_elmt_size);
+        printf("  max_nelmts_bits=%u8d\n",              max_nelmts_bits);
+        printf("  idx_blk_elmts=%u8d\n",                idx_blk_elmts);
+        printf("  data_blk_min_elmts=%u8d\n",           data_blk_min_elmts);
+        printf("  sup_blk_min_data_ptrs=%u8d\n",        sup_blk_min_data_ptrs);
+        printf("  max_dblk_page_nelmts_bits=%u8d\n",    max_dblk_page_nelmts_bits);
+        printf("  nsuper_blks=%u64d\n",                 bytes_to_u64_le(nsuper_blks_raw));
+        printf("  super_blk_size=%u64d\n",              bytes_to_u64_le(super_blk_size_raw));
+        printf("  ndata_blks=%u64d\n",                  bytes_to_u64_le(ndata_blks_raw));
+        printf("  data_blk_size=%u64d\n",               bytes_to_u64_le(data_blk_size_raw));
+        printf("  max_idx_set=%u64d\n",                 bytes_to_u64_le(max_idx_set_raw));
+        printf("  nelmts=%u64d\n",                      bytes_to_u64_le(nelmts_raw));
+        printf("  idx_blk_addr=%u64d\n",              bytes_to_u64_le(idx_blk_addr_raw));
+        printf("  chksum=%u32d\n",                    chksum);
+        printf("  [derived] arr_off_size=%u8d\n",        global_ea_arr_off_size);
+        printf("  [derived] nsblks=%u64d\n",             global_ea_nsblks);
+        printf("  [derived] iblk_nsblks=%u64d\n",       global_ea_iblk_nsblks);
+        printf("  [derived] ndblk_addrs=%u64d\n",       global_ea_ndblk_addrs);
+        printf("  [derived] nsblk_addrs=%u64d\n",       global_ea_nsblk_addrs);
+        printf("  [derived] dblk_page_nelmts=%u64d\n",  global_ea_dblk_page_nelmts);
+        printf("  [derived] chunk_size_len=%u8d\n",     global_ea_chunk_size_len);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Extensible Array Index Block  (signature "EAIB")
+ *
+ * Map after ea_hdr so that all global_ea_* parameters are correct.
+ *
+ * On-disk layout (matches H5EA__cache_iblock_serialize):
+ *   [sig:4][ver:1][client_id:1][hdr_addr:O]
+ *   [elements: idx_blk_elmts * raw_elmt_size]
+ *   [dblk_addrs: ndblk_addrs * O]
+ *   [sblk_addrs: nsblk_addrs * O]
+ *   [chksum:4]
+ * ----------------------------------------------------------------------- */
+
+type ea_iblock = struct {
+    byte[4] signature == ['E','A','I','B'];
+    byte    version   == 0;
+    byte    client_id;
+    /* Back-pointer: file address of the Extensible Array header.           */
+    byte[global_sizeof_offsets] hdr_addr_raw;
+    /* Direct elements stored inline in the index block.                    */
+    ea_element[global_ea_idx_blk_elmts] elements;
+    /* Data block addresses for the first global_ea_iblk_nsblks sblk groups.
+     * dblk_addrs[0..ndblks[0]-1]   belong to sblk group 0,
+     * dblk_addrs[ndblks[0].....]   belong to sblk group 1, etc.           */
+    byte[global_sizeof_offsets][global_ea_ndblk_addrs] dblk_addrs;
+    /* Secondary block addresses for the remaining sblk groups.
+     * sblk_addrs[i] -> sblk for group (iblk_nsblks + i).                  */
+    byte[global_sizeof_offsets][global_ea_nsblk_addrs] sblk_addrs;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("ea_iblock {\n");
+        printf("  signature=%v\n",     signature);
+        printf("  version=%v\n",       version);
+        printf("  client_id=%u8d\n",     client_id);
+        printf("  hdr_addr=%u64d\n", bytes_to_u64_le(hdr_addr_raw));
+        /* Direct elements                                                  */
+        var i = 0UL;
+        while (i < global_ea_idx_blk_elmts as uint<64>) {
+            if (global_ea_client_id == 0UB || global_ea_client_id == 2UB) {
+                var e = ea_chunk_elem @
+                        (elements[i]'offset as offset<uint<64>,B>);
+                printf("  elements[%u64d]: addr=%u64d\n",
+                       i, bytes_to_u64_le(e.addr_raw));
+            } else {
+                var e = ea_filt_chunk_elem @
+                        (elements[i]'offset as offset<uint<64>,B>);
+                printf("  elements[%u64d]: addr=%u64d chunk_size_raw=%u64d filter_mask=0x%u32x\n",
+                       i, bytes_to_u64_le(e.addr_raw),
+                       bytes_to_u64_le(e.chunk_size_raw), e.filter_mask);
+            }
+            i = i + 1UL;
+        }
+        /* Direct data block addresses, annotated by sblk group             */
+        var dblk_idx = 0UL;
+        var u = 0UL;
+        while (u < global_ea_iblk_nsblks) {
+            var sblk_ndblks     = 1UL <<. (u / 2UL);
+            var sblk_dblk_nelmts =
+                (1UL <<. ((u + 1UL) / 2UL))
+                * (global_ea_data_blk_min_elmts as uint<64>);
+            var j = 0UL;
+            while (j < sblk_ndblks) {
+                printf("  dblk_addrs[%u64d] (sblk_grp=%u64d, nelmts=%u64d): addr=%u64d\n",
+                       dblk_idx, u, sblk_dblk_nelmts,
+                       bytes_to_u64_le(dblk_addrs[dblk_idx]));
+                dblk_idx = dblk_idx + 1UL;
+                j = j + 1UL;
+            }
+            u = u + 1UL;
+        }
+        /* Secondary block addresses                                            */
+        var s = 0UL;
+        while (s < global_ea_nsblk_addrs) {
+            printf("  sblk_addrs[%u64d] (sblk_grp=%u64d): addr=%u64d\n",
+                   s, global_ea_iblk_nsblks + s,
+                   bytes_to_u64_le(sblk_addrs[s]));
+            s = s + 1UL;
+        }
+        printf("  chksum=%u32d\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Extensible Array Secondary Block  (signature "EASB")
+ *
+ * Call set_ea_sblock_idx(u) before mapping to configure:
+ *   global_ea_sblk_ndblks, global_ea_sblk_dblk_nelmts,
+ *   global_ea_sblk_dblk_npages, global_ea_sblk_dblk_page_init_size,
+ *   global_ea_sblk_total_page_init_size
+ *
+ * On-disk layout (matches H5EA__cache_sblock_serialize):
+ *   [sig:4][ver:1][client_id:1][hdr_addr:O][block_off:arr_off_size]
+ *   [page_init: ndblks * dblk_page_init_size bytes, if paged]
+ *   [dblk_addrs: ndblks * O]
+ *   [chksum:4]
+ * ----------------------------------------------------------------------- */
+
+type ea_sblock = struct {
+    byte[4] signature == ['E','A','S','B'];
+    byte    version   == 0;
+    byte    client_id;
+    /* Back-pointer: file address of the Extensible Array header.           */
+    byte[global_sizeof_offsets]  hdr_addr_raw;
+    /* Array offset of the first element reached through this secondary block.  */
+    byte[global_ea_arr_off_size] block_off_raw;
+    /* Page-init bitmask: ndblks * ceil(dblk_npages/8) bytes.
+     * Zero-length when data blocks in this sblk are not paged.             */
+    byte[global_ea_sblk_total_page_init_size] page_init_flags;
+    /* Data block addresses: one per data block in this secondary block.        */
+    byte[global_sizeof_offsets][global_ea_sblk_ndblks] dblk_addrs;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("ea_sblock {\n");
+        printf("  signature=%v\n",      signature);
+        printf("  version=%v\n",        version);
+        printf("  client_id=%u8d\n",      client_id);
+        printf("  hdr_addr=%u64d\n",  bytes_to_u64_le(hdr_addr_raw));
+        printf("  block_off=%u64d\n",   bytes_to_u64_le(block_off_raw));
+        printf("  [sblk_idx=%u64d ndblks=%u64d dblk_nelmts=%u64d dblk_npages=%u64d]\n",
+               global_ea_sblk_idx, global_ea_sblk_ndblks,
+               global_ea_sblk_dblk_nelmts, global_ea_sblk_dblk_npages);
+        if (global_ea_sblk_dblk_npages > 0UL)
+            printf("  page_init_flags=%v\n", page_init_flags);
+        var k = 0UL;
+        while (k < global_ea_sblk_ndblks) {
+            printf("  dblk_addrs[%u64d]: addr=%u64d\n",
+                   k, bytes_to_u64_le(dblk_addrs[k]));
+            k = k + 1UL;
+        }
+        printf("  chksum=%u32d\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Extensible Array Data Block  (signature "EADB")
+ *
+ * Call set_ea_dblock(nelmts) before mapping to configure:
+ *   global_ea_dblk_nelmts, global_ea_dblk_npages
+ *
+ * Non-paged (global_ea_dblk_npages == 0):
+ *   [sig:4][ver:1][client_id:1][hdr_addr:O][block_off:arr_off_size]
+ *   [elements: nelmts * raw_elmt_size][chksum:4]
+ *
+ * Paged (global_ea_dblk_npages > 0):
+ *   [sig:4][ver:1][client_id:1][hdr_addr:O][block_off:arr_off_size][chksum:4]
+ *   Data block pages follow the prefix immediately in the file.
+ *   Each page: [elements: dblk_page_nelmts * raw_elmt_size][chksum:4]
+ * ----------------------------------------------------------------------- */
+
+type ea_dblock_nopaged = struct {
+    byte[4] signature == ['E','A','D','B'];
+    byte    version   == 0;
+    byte    client_id;
+    byte[global_sizeof_offsets]  hdr_addr_raw;
+    byte[global_ea_arr_off_size] block_off_raw;
+    ea_element[global_ea_dblk_nelmts] elements;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("ea_dblock_nopaged {\n");
+        printf("  signature=%v\n",     signature);
+        printf("  version=%v\n",       version);
+        printf("  client_id=%u8d\n",     client_id);
+        printf("  hdr_addr=%u64d\n", bytes_to_u64_le(hdr_addr_raw));
+        printf("  block_off=%u64d\n",  bytes_to_u64_le(block_off_raw));
+        var i = 0UL;
+        while (i < global_ea_dblk_nelmts) {
+            if (global_ea_client_id == 0UB || global_ea_client_id == 2UB) {
+                var e = ea_chunk_elem @
+                        (elements[i]'offset as offset<uint<64>,B>);
+                printf("  elements[%u64d]: addr=%u64d\n",
+                       i, bytes_to_u64_le(e.addr_raw));
+            } else {
+                var e = ea_filt_chunk_elem @
+                        (elements[i]'offset as offset<uint<64>,B>);
+                printf("  elements[%u64d]: addr=%u64d chunk_size_raw=%u64d filter_mask=0x%u32x\n",
+                       i, bytes_to_u64_le(e.addr_raw),
+                       bytes_to_u64_le(e.chunk_size_raw), e.filter_mask);
+            }
+            i = i + 1UL;
+        }
+        printf("  chksum=%u32d\n", chksum);
+        printf("}\n");
+    }
+};
+
+type ea_dblock_paged = struct {
+    byte[4] signature == ['E','A','D','B'];
+    byte    version   == 0;
+    byte    client_id;
+    byte[global_sizeof_offsets]  hdr_addr_raw;
+    byte[global_ea_arr_off_size] block_off_raw;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("ea_dblock_paged {\n");
+        printf("  signature=%v\n",     signature);
+        printf("  version=%v\n",       version);
+        printf("  client_id=%u8d\n",     client_id);
+        printf("  hdr_addr=%u64d\n", bytes_to_u64_le(hdr_addr_raw));
+        printf("  block_off=%u64d\n",  bytes_to_u64_le(block_off_raw));
+        printf("  [npages=%u64d, page_nelmts=%u64d; pages follow prefix]\n",
+               global_ea_dblk_npages, global_ea_dblk_page_nelmts);
+        printf("  chksum=%u32d\n", chksum);
+        printf("}\n");
+    }
+};
+
+type ea_dblock = union {
+    ea_dblock_paged   paged   : (global_ea_dblk_npages > 0UL);
+    ea_dblock_nopaged nopaged;
+
+    method _print = void:
+    {
+        if (global_ea_dblk_npages > 0UL)
+            paged._print;
+        else
+            nopaged._print;
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * Extensible Array Data Block Page  (no on-disk signature)
+ *
+ * All pages hold exactly global_ea_dblk_page_nelmts elements (data block
+ * sizes in the EA always divide evenly into pages).
+ *
+ * On-disk layout:
+ *   [elements: dblk_page_nelmts * raw_elmt_size][chksum:4]
+ * ----------------------------------------------------------------------- */
+
+type ea_dblk_page = struct {
+    ea_element[global_ea_dblk_page_nelmts] elements;
+    uint<32> chksum;
+
+    method _print = void:
+    {
+        printf("ea_dblk_page {\n");
+        var i = 0UL;
+        while (i < global_ea_dblk_page_nelmts) {
+            if (global_ea_client_id == 0UB || global_ea_client_id == 2UB) {
+                var e = ea_chunk_elem @
+                        (elements[i]'offset as offset<uint<64>,B>);
+                printf("  elements[%u64d]: addr=%u64d\n",
+                       i, bytes_to_u64_le(e.addr_raw));
+            } else {
+                var e = ea_filt_chunk_elem @
+                        (elements[i]'offset as offset<uint<64>,B>);
+                printf("  elements[%u64d]: addr=%u64d chunk_size_raw=%u64d filter_mask=0x%u32x\n",
+                       i, bytes_to_u64_le(e.addr_raw),
+                       bytes_to_u64_le(e.chunk_size_raw), e.filter_mask);
+            }
+            i = i + 1UL;
+        }
+        printf("  chksum=%u32d\n", chksum);
+        printf("}\n");
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_ea_dblock_at -- map and print a data block (and its pages if paged)
+ *
+ * off:    file offset of the data block
+ * nelmts: number of elements in this data block
+ * ----------------------------------------------------------------------- */
+
+fun print_ea_dblock_at = (offset<uint<64>,B> off, uint<64> nelmts) void:
+{
+    set_ea_dblock(nelmts);
+    var db = ea_dblock @ off;
+    db._print;
+    if (global_ea_dblk_npages > 0UL) {
+        var pg_off = (db.paged'offset + db.paged'size) as offset<uint<64>,B>;
+        var p = 0UL;
+        while (p < global_ea_dblk_npages) {
+            printf("--- ea_dblk_page %u64d ---\n", p);
+            var pg = ea_dblk_page @ pg_off;
+            pg._print;
+            pg_off = (pg'offset + pg'size) as offset<uint<64>,B>;
+            p = p + 1UL;
+        }
+    }
+};
+
+/* ----------------------------------------------------------------------- *
+ * print_ea -- convenience wrapper
+ *
+ * Maps the Extensible Array header at the given file offset, prints it and
+ * the index block, then walks all reachable data blocks and secondary blocks,
+ * skipping HADDR_UNDEF entries.
+ *
+ * Usage:
+ *   print_ea(<addr>#B);
+ * ----------------------------------------------------------------------- */
+
+fun print_ea = (offset<uint<64>,B> off) void:
+{
+    /* --- Header --------------------------------------------------------- */
+    var hdr = ea_hdr @ off;
+    hdr._print;
+
+    /* --- Index block ---------------------------------------------------- */
+    var ib = ea_iblock @ bytes_to_off(hdr.idx_blk_addr_raw);
+    ib._print;
+
+    /* --- Direct data blocks (first global_ea_iblk_nsblks sblk groups) --- */
+    var dblk_idx = 0UL;
+    var u = 0UL;
+    while (u < global_ea_iblk_nsblks) {
+        var sblk_ndblks     = 1UL <<. (u / 2UL);
+        var sblk_dblk_nelmts =
+            (1UL <<. ((u + 1UL) / 2UL))
+            * (global_ea_data_blk_min_elmts as uint<64>);
+        var j = 0UL;
+        while (j < sblk_ndblks) {
+            if (!ea_is_undef_addr(ib.dblk_addrs[dblk_idx])) {
+                printf("--- ea_dblock (sblk_grp=%u64d, j=%u64d, nelmts=%u64d) ---\n",
+                       u, j, sblk_dblk_nelmts);
+                print_ea_dblock_at(
+                    bytes_to_u64_le(ib.dblk_addrs[dblk_idx])#B,
+                    sblk_dblk_nelmts);
+            }
+            dblk_idx = dblk_idx + 1UL;
+            j = j + 1UL;
+        }
+        u = u + 1UL;
+    }
+
+    /* --- Secondary blocks and their data blocks ----------------------------- */
+    var s = 0UL;
+    while (s < global_ea_nsblk_addrs) {
+        if (!ea_is_undef_addr(ib.sblk_addrs[s])) {
+            var sblk_grp = global_ea_iblk_nsblks + s;
+            printf("--- ea_sblock (sblk_grp=%u64d) ---\n", sblk_grp);
+            set_ea_sblock_idx(sblk_grp);
+            var sb = ea_sblock @
+                     (bytes_to_u64_le(ib.sblk_addrs[s])#B);
+            sb._print;
+
+            /* Data blocks within this secondary block                          */
+            var k = 0UL;
+            while (k < global_ea_sblk_ndblks) {
+                if (!ea_is_undef_addr(sb.dblk_addrs[k])) {
+                    printf("--- ea_dblock (sblk_grp=%u64d, k=%u64d, nelmts=%u64d) ---\n",
+                           sblk_grp, k, global_ea_sblk_dblk_nelmts);
+                    print_ea_dblock_at(
+                        bytes_to_u64_le(sb.dblk_addrs[k])#B,
+                        global_ea_sblk_dblk_nelmts);
+                }
+                k = k + 1UL;
+            }
+        }
+        s = s + 1UL;
+    }
+};
