@@ -58,6 +58,8 @@ fun lookup3_u32_be = (byte[] raw) uint<32>:
   return v;
 }
 
+/* Six-step avalanche mix; rotation constants (4,6,8,16,19,4) are from the
+   reference implementation and must not be changed. */
 fun lookup3_mix = (uint<32> a, uint<32> b, uint<32> c) uint<32>[]:
 {
   a -= c; a ^= lookup3_rot (c, 4);  c += b;
@@ -69,6 +71,8 @@ fun lookup3_mix = (uint<32> a, uint<32> b, uint<32> c) uint<32>[]:
   return [a, b, c];
 }
 
+/* Seven-step final mix applied once to the tail; rotation constants are from
+   the reference and chosen for full avalanche. */
 fun lookup3_final = (uint<32> a, uint<32> b, uint<32> c) uint<32>[]:
 {
   c ^= b; c -= lookup3_rot (b, 14);
@@ -81,6 +85,8 @@ fun lookup3_final = (uint<32> a, uint<32> b, uint<32> c) uint<32>[]:
   return [a, b, c];
 }
 
+/* Hash an array of 32-bit words; tail words (< 3 remaining) are added via a
+   length-gated cascade rather than a switch fall-through. */
 fun lookup3_hashword_core = (uint<32>[] key, uint<32> pc, uint<32> pb = 0) uint<32>[]:
 {
   var length = key'length;
@@ -129,6 +135,8 @@ fun lookup3_hashword2 = (uint<32>[] key, uint<32> pc, uint<32> pb) uint<32>[]:
   return [state[2], state[1]];
 }
 
+/* Hash a byte array assuming little-endian packing; tail bytes (< 12) are fed
+   LSB-first into a, then b, then c. */
 fun lookup3_hashlittle_core = (byte[] data, uint<32> pc, uint<32> pb = 0) uint<32>[]:
 {
   var length = data'length;
@@ -195,6 +203,8 @@ fun lookup3_hashlittle2 = (byte[] data, uint<32> pc, uint<32> pb) uint<32>[]:
   return [state[2], state[1]];
 }
 
+/* Hash a byte array assuming big-endian packing; tail bytes are fed MSB-first.
+   Takes only one seed (no pb) matching the reference. */
 fun lookup3_hashbig_core = (byte[] data, uint<32> initval) uint<32>[]:
 {
   var length = data'length;

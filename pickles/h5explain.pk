@@ -231,6 +231,8 @@ fun h5explain_map_layout = (offset<uint<64>,B> off) H5O_msg_layout:
     return H5O_msg_layout @ off;
 }
 
+/* Identify HDF5 primitive type; the v1-OHDR path uses a heuristic because v1
+   has no signature. */
 fun h5explain_detect_kind = (offset<uint<64>,B> off) int:
 {
     var sig = h5explain_map_b4(off);
@@ -280,6 +282,8 @@ fun h5explain_find_super = offset<uint<64>,B>:
     return 0UL#B;
 }
 
+/* Walk ohdr message chunks (following continuations) to learn chunked-dataset
+   ndims before a v1 B-tree is decoded. */
 fun h5explain_scan_layouts_in_chunk = (uint<8> version, int prefix_bytes,
                                        offset<uint<64>,B> chunk_off,
                                        uint<64> chunk_size) void:
@@ -338,6 +342,8 @@ fun h5explain_scan_layouts_in_chunk = (uint<8> version, int prefix_bytes,
     }
 }
 
+/* Parse the ohdr header once and stash version/prefix/chunk bounds in scratch
+   vars so downstream callers share a single parse. */
 fun h5explain_load_ohdr_ctx = (offset<uint<64>,B> off) void:
 {
     var hdr = h5explain_map_ohdr(off);
@@ -376,6 +382,8 @@ fun h5explain_prime_superblock = void:
     }
 }
 
+/* Extract metadata that must be known before a structure can be decoded
+   (B-tree k values, ndims, nrec sizes). */
 fun h5explain_prime_current = void:
 {
     if (h5explain_cur_kind == H5EX_KIND_SUPER) {
@@ -502,6 +510,8 @@ fun cur = any:
     return h5explain_map_raw(h5explain_cur_off);
 }
 
+/* Dispatch to type-specific printing; for OHDR and B-tree headers this adds
+   guidance beyond the raw struct. */
 fun info = void:
 {
     var value = cur;
@@ -605,6 +615,8 @@ fun h5explain_reset_stab = void:
     h5explain_stab_heap_addr = 0UL#B;
 }
 
+/* Scan ohdr message chunks (following continuations) for a symbol table message;
+   result lands in the h5explain_stab_* globals. */
 fun h5explain_find_stab_in_chunk = (uint<8> version, int prefix_bytes,
                                     offset<uint<64>,B> chunk_off,
                                     uint<64> chunk_size) void:
@@ -649,6 +661,8 @@ fun h5explain_find_stab_in_chunk = (uint<8> version, int prefix_bytes,
     }
 }
 
+/* Find the old-style (v1 B-tree + local heap) group symbol table; falls back to
+   the superblock scratch-pad for the root group. */
 fun h5explain_find_old_group_stab = (uint<8> version, int prefix_bytes,
                                      offset<uint<64>,B> chunk_off,
                                      uint<64> chunk_size) int:
@@ -672,6 +686,8 @@ fun h5explain_find_old_group_stab = (uint<8> version, int prefix_bytes,
     return h5explain_stab_found;
 }
 
+/* Enumerate entries in a symbol table node; cache_type 2 entries are skipped
+   because they are "empty" slots, not objects. */
 fun h5explain_links_in_snod = (offset<uint<64>,B> snod_off,
                                offset<uint<64>,B> heap_addr,
                                string wanted = "",
@@ -700,6 +716,7 @@ fun h5explain_links_in_snod = (offset<uint<64>,B> snod_off,
     return count;
 }
 
+/* Recurse the group v1 B-tree (node_type 0 only) and collect links from every SNOD leaf. */
 fun h5explain_links_in_v1_btree = (offset<uint<64>,B> btree_addr,
                                    offset<uint<64>,B> heap_addr,
                                    string wanted = "",
@@ -725,6 +742,8 @@ fun h5explain_links_in_v1_btree = (offset<uint<64>,B> btree_addr,
     return count;
 }
 
+/* Walk ohdr message chunks (following continuations) collecting hard-link
+   messages; dense links stored in a v2 B-tree are not decoded here. */
 fun h5explain_links_in_chunk = (uint<8> version, int prefix_bytes,
                                 offset<uint<64>,B> chunk_off,
                                 uint<64> chunk_size,
@@ -816,6 +835,8 @@ fun h5explain_push_cur = void:
     h5explain_has_prev = 1;
 }
 
+/* Navigate into a hard link by name; searches both new-style link messages and
+   old-style symbol table, then pushes the current location. */
 fun cd = (string name) void:
 {
     if (h5explain_cur_kind != H5EX_KIND_OHDR) {
