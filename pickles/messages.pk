@@ -54,7 +54,7 @@ type H5O_msg_sdspace =
                 byte ndims;
                 byte flags;
                 byte space_type;
-                byte[global_sizeof_lengths] [ndims] dim_size if (space_type == 1U);
+                byte[global_sizeof_lengths] [ndims] dim_size if (space_type == 1);
                 byte[global_sizeof_lengths] [ndims] max if (flags & 1U) != 0;
 
                 method print_indented = (int depth) void:
