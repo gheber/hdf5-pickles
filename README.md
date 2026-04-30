@@ -62,6 +62,27 @@ OHDR            0x00000000000000C3 (195)
 TREE            0x00000000000001DF (479)
 ```
 
+## h5explain Interactive Explorer
+
+`h5explain` starts GNU poke with the repository pickles loaded and installs a small command layer for incremental HDF5 byte-level exploration:
+
+```sh
+./h5explain [-n|--non-strict] FILE [OFFSET]
+./h5explain --help
+```
+
+`OFFSET` may be decimal or hexadecimal, for example `48` or `0x30`. Without an offset, the tool starts at the HDF5 superblock.
+
+**Navigation commands:** `root`, `h5super`, `cd ("NAME")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
+
+**Inspection commands:** `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
+
+Type `help` at the prompt for a full description of each command.
+
+`traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.
+
+`back` returns to the location before the most recent navigation step (`go`, `gos`, `cd`, `root`, `h5super`). Only one level of history is kept.
+
 ## Quick Tutorial
 
 This short tutorial shows how to explore the sample HDF5 file `file.h5` from the poke REPL using the pickles in this repository. It assumes GNU poke is installed and that you start from the repository root.
