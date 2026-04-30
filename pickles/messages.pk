@@ -54,8 +54,8 @@ type H5O_msg_sdspace =
                 byte ndims;
                 byte flags;
                 byte space_type;
-                byte[global_sizeof_lengths] dim_size;
-                byte[global_sizeof_lengths] max if (flags & 1U) != 0;
+                byte[global_sizeof_lengths] [ndims] dim_size if (space_type == 1U);
+                byte[global_sizeof_lengths] [ndims] max if (flags & 1U) != 0;
 
                 method print_indented = (int depth) void:
                 {
@@ -63,9 +63,16 @@ type H5O_msg_sdspace =
                     indent(depth); printf("  v2=struct {\n");
                     indent(depth); printf("    ndims=%v\n", ndims);
                     indent(depth); printf("    flags=%v\n", flags);
-                    indent(depth); printf("    space_type= %v\n", space_type);
-                    indent(depth); printf("    dim_size=%v\n", dim_size);
-                    indent(depth); printf("    max= %v\n", max);
+                    indent(depth); printf("    space_type=%v (%s)\n", space_type,
+                        (space_type == 0 ? "Scalar"
+                         : (space_type == 1 ? "Simple"
+                            : (space_type == 2 ? "Null" : "Unknown"))));
+                    if (space_type == 1) {
+                        indent(depth); printf("    dim_size=%v\n", dim_size);
+                        if ((flags & 1U) != 0) {
+                            indent(depth); printf("    max=%v\n", max);
+                        }
+                    }
                     indent(depth); printf("  }\n");
                     indent(depth); printf("}\n");
                 }
