@@ -41,9 +41,15 @@ type H5O_msg_sdspace =
                     indent(depth); printf("    ndims=%v\n", ndims);
                     indent(depth); printf("    flags=%v\n", flags);
                     indent(depth); printf("    res=%v\n", res);
-                    indent(depth); printf("    dim_size=%v\n", dim_size);
-                    indent(depth); printf("    max=%v\n", max);
-                    indent(depth); printf("    perm=%v\n", max);
+                    if (ndims > 0UB) {
+                        indent(depth); printf("    dim_size=%v\n", dim_size);
+                        if ((flags & 1U) != 0) {
+                            indent(depth); printf("    max=%v\n", max);
+                        }
+                        if ((flags & 2U) != 0) {
+                            indent(depth); printf("    perm=%v\n", perm);
+                        }
+                    }
                     indent(depth); printf("  }\n");
                     indent(depth); printf("}\n");
                 }
@@ -959,8 +965,31 @@ type H5O_msg_dtype =
         method print_dtype_indent = (int depth) void:
         {
             indent(depth); printf("H5O_msg_dtype {\n");
-            if (ctype == 0)
+            if (ctype == 0) {
                 types.fixed_point.print_indented(depth+1);
+            } else if (ctype == 1) {
+                types.floating_point.print_indented(depth+1);
+            } else if (ctype == 2) {
+                types.time.print_indented(depth+1);
+            } else if (ctype == 3) {
+                types.text_string.print_indented(depth+1);
+            } else if (ctype == 4) {
+                types.bitfield.print_indented(depth+1);
+            } else if (ctype == 5) {
+                types.opaque.print_indented(depth+1);
+            } else if (ctype == 6) {
+                types.compound.print_indented(depth+1);
+            } else if (ctype == 7) {
+                types.reference.print_indented(depth+1);
+            } else if (ctype == 8) {
+                types.enumeration.print_indented(depth+1);
+            } else if (ctype == 9) {
+                types.variable_length.print_indented(depth+1);
+            } else if (ctype == 10) {
+                types.array.print_indented(depth+1);
+            } else {
+                indent(depth+1); printf("Unknown class type=%v\n", ctype);
+            }
             indent(depth); printf("}\n");
         }
 
@@ -1392,38 +1421,84 @@ type H5O_msg_attr =
         byte[(version == 1 ? align_size(dtype_size) : dtype_size)] dtype;
         byte[(version == 1 ? align_size(dspace_size) : dspace_size)] dspace;
 
+        fun dim_size_at = (off64 dims_off, int idx) uint<64>:
+        {
+            var width = global_sizeof_lengths as uint<64>;
+            return bytes_to_u64_le(byte[global_sizeof_lengths] @
+                                   (dims_off + ((idx as uint<64>) * width)#B));
+        }
+
+        fun shared_msg_payload_offset = (off64 shared_off) off64:
+        {
+            var obj_off = bytes_to_off(byte[global_sizeof_offsets] @
+                                       (shared_off + 2#B));
+
+            if ((byte @ obj_off) == 'O'
+                && (byte @ (obj_off + 1#B)) == 'H'
+                && (byte @ (obj_off + 2#B)) == 'D'
+                && (byte @ (obj_off + 3#B)) == 'R') {
+                var ohdr_flags = byte @ (obj_off + 5#B);
+                var cur = obj_off + 6#B;
+
+                if ((ohdr_flags & 32U) != 0)
+                    cur = cur + 16#B;
+                if ((ohdr_flags & 16U) != 0)
+                    cur = cur + 4#B;
+
+                cur = cur + (1UL <<. (ohdr_flags & 3U))#B;
+                if ((ohdr_flags & 4U) != 0)
+                    return cur + 6#B;
+                return cur + 4#B;
+            }
+
+            return obj_off + 24#B;
+        }
+
+        fun dtype_msg_offset = off64:
+        {
+            if (version >= 2UB && (flags & 1U) != 0)
+                return shared_msg_payload_offset(dtype'offset);
+            return dtype'offset;
+        }
+
+        fun dspace_msg_offset = off64:
+        {
+            if (version >= 2UB && (flags & 2U) != 0)
+                return shared_msg_payload_offset(dspace'offset);
+            return dspace'offset;
+        }
+
         /* Function to calculate data size */
         fun get_data_size = uint<64>:
         {
-            var dt = H5O_msg_dtype @ dtype'offset;
-            var ds = H5O_msg_sdspace @ dspace'offset;
-
-            var stype = 0;  /* H5S_SCALAR */
-            var num_dims = ds.space.v1.ndims;
-            var tmp = (byte[global_sizeof_lengths] @ ds.space.v1.dim_size'offset);
+            var dt = H5O_msg_dtype @ dtype_msg_offset();
+            var ds = H5O_msg_sdspace @ dspace_msg_offset();
 
             if (ds.version >= 2) {
-                stype = ds.space.v2.space_type;
-                num_dims = ds.space.v2.ndims;
-                tmp = (byte[global_sizeof_lengths] @ ds.space.v2.dim_size'offset);
-            } else {
-                if (ds.space.v1.ndims > 0)
-                    stype = 1; /* H5S_SIMPLE */
-            }
+                if (ds.space.v2.space_type == 2UB) /* H5S_NULL */
+                    return 0UL;
 
-            var nelem = 1;
-            if (stype == 2) /* H5S_NULL */
-                nelem = 0;
+                var nelem = 1UL; /* H5S_SCALAR */
+                if (ds.space.v2.space_type == 1UB) { /* H5S_SIMPLE */
+                    var i = 0;
+                    while (i < ds.space.v2.ndims as int) {
+                        nelem *= dim_size_at(ds.space.v2.dim_size'offset, i);
+                        i++;
+                    }
+                }
+
+                return (dt.hdr.elm_size as uint<64>) * nelem;
+            }
             else {
+                var nelem = 1UL; /* H5S_SCALAR when ndims == 0 */
                 var i = 0;
-                while (i < num_dims) {
-                    nelem *= tmp[i];
+                while (i < ds.space.v1.ndims as int) {
+                    nelem *= dim_size_at(ds.space.v1.dim_size'offset, i);
                     i++;
                 }
-            }
 
-            var data_size = dt.hdr.elm_size * nelem;
-            return (data_size);
+                return (dt.hdr.elm_size as uint<64>) * nelem;
+            }
         }
 
         var mm = get_data_size();
@@ -1443,10 +1518,10 @@ type H5O_msg_attr =
 
             printf("  name=%v-->%v\n", name, char_array_to_string(name));
 
-            var ii = H5O_msg_dtype@dtype'offset;
+            var ii = H5O_msg_dtype@dtype_msg_offset();
             ii.print_dtype_indent(1);
 
-            var jj = H5O_msg_sdspace@dspace'offset;
+            var jj = H5O_msg_sdspace@dspace_msg_offset();
             jj.print_dspace_indent(1);
 
             printf("  data=%v\n", data);
