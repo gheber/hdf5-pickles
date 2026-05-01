@@ -2,9 +2,9 @@
 
 ## Marker Scanner
 
-`marker_scan` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
+`h5markers` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
 
-`marker_scan` can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
+`h5markers` can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
 
 Build:
 
@@ -17,21 +17,21 @@ Usage:
 
 ```bash
 # List all known markers
-build/marker_scan --list-markers
+build/h5markers --list-markers
 
 # Scan a file with the default thread count
-build/marker_scan path/to/file.h5
+build/h5markers path/to/file.h5
 
 # Scan with an explicit thread count (-j is a synonym for --threads)
-build/marker_scan --threads 8 path/to/file.h5.onion
-build/marker_scan -j 8 path/to/file.h5.onion
+build/h5markers --threads 8 path/to/file.h5.onion
+build/h5markers -j 8 path/to/file.h5.onion
 
 # Restrict the scan (and listing) to one group of markers
-build/marker_scan --group HDF5 path/to/file.h5
-build/marker_scan --group Onion --list-markers path/to/file.h5.onion
+build/h5markers --group HDF5 path/to/file.h5
+build/h5markers --group Onion --list-markers path/to/file.h5.onion
 
 # Show usage
-build/marker_scan --help
+build/h5markers --help
 ```
 
 The scanner prints one line per detected marker with the marker name and its file offset in both
