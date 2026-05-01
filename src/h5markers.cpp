@@ -1,4 +1,4 @@
-/* main.cpp - File format marker scanner.  */
+/* h5markers.cpp - File format marker scanner.  */
 
 /* Copyright (C) 2026 The HDF Group.  */
 

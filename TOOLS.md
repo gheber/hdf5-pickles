@@ -1,0 +1,68 @@
+# Tools
+
+## Marker Scanner
+
+`h5markers` is a multithreaded file scanner for the concrete on-disk markers defined in the [HDF5 file format specification](https://support.hdfgroup.org/documentation/hdf5/latest/_f_m_t4.html) and the [Onion file format](https://support.hdfgroup.org/releases/hdf5/documentation/rfc/Onion_VFD_RFC_211122.pdf). See also the [MARKERS.md](MARKERS.md) file for a complete list of known markers.
+
+`h5markers` can be used to quickly identify the locations of these markers in large files, which can be useful for debugging, data recovery, or understanding file structure.
+
+Build:
+
+```bash
+cmake -S . -B build
+cmake --build build
+```
+
+Usage:
+
+```bash
+# List all known markers
+build/h5markers --list-markers
+
+# Scan a file with the default thread count
+build/h5markers path/to/file.h5
+
+# Scan with an explicit thread count (-j is a synonym for --threads)
+build/h5markers --threads 8 path/to/file.h5.onion
+build/h5markers -j 8 path/to/file.h5.onion
+
+# Restrict the scan (and listing) to one group of markers
+build/h5markers --group HDF5 path/to/file.h5
+build/h5markers --group Onion --list-markers path/to/file.h5.onion
+
+# Show usage
+build/h5markers --help
+```
+
+The scanner prints one line per detected marker with the marker name and its file offset in both
+hexadecimal and decimal. Progress is reported on stderr when scanning in a terminal.
+
+For example, scanning the sample file `file.h5` in this repository produces the following output:
+
+```text
+HDF5_SIGNATURE  0x0000000000000000 (0)                      
+OHDR            0x0000000000000030 (48)
+OHDR            0x00000000000000C3 (195)
+TREE            0x00000000000001DF (479)
+```
+
+## h5explain Interactive Explorer
+
+`h5explain` starts GNU poke with the repository pickles loaded and installs a small command layer for incremental HDF5 byte-level exploration:
+
+```sh
+./tools/h5explain [-n|--non-strict] FILE [OFFSET]
+./tools/h5explain --help
+```
+
+`OFFSET` may be decimal or hexadecimal, for example `48` or `0x30`. Without an offset, the tool starts at the HDF5 superblock.
+
+**Navigation commands:** `root`, `h5super`, `cd ("NAME")`, `go (OFF#B)`, `go (OFF#B, "PATH")`, `gos ("0xADDR")`, `gos ("0xADDR", "PATH")`, `back`, `pwd`
+
+**Inspection commands:** `info`, `msgs`, `cur`, `ls` / `links`, `traverse`, `dump`, `h5dump`
+
+Type `help` at the prompt for a full description of each command.
+
+`traverse` is the only command that recursively walks chunk indexes. Ordinary navigation and `info` map the current primitive only, so large chunk indexes are not traversed accidentally.
+
+`back` returns to the location before the most recent navigation step (`go`, `gos`, `cd`, `root`, `h5super`). Only one level of history is kept.
