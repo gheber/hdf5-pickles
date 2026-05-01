@@ -10,11 +10,14 @@ This repository is a work in progress. The current pickles focus on core HDF5 me
 
 - [`pickles/common.pk`](pickles/common.pk): shared helpers and common definitions
 - [`pickles/superblock.pk`](pickles/superblock.pk): HDF5 superblock definitions
-- [`pickles/btree.pk`](pickles/btree.pk): B-tree definitions
-- [`pickles/ohdr.pk`](pickles/ohdr.pk): object header definitions
 - [`pickles/messages.pk`](pickles/messages.pk): object header message definitions
+- [`pickles/ohdr.pk`](pickles/ohdr.pk): object header definitions
+- [`pickles/btree.pk`](pickles/btree.pk): umbrella loader for version 1 and version 2 B-tree definitions
+- [`pickles/v1_btree.pk`](pickles/v1_btree.pk): version 1 B-tree and symbol table node definitions
+- [`pickles/v2_btree.pk`](pickles/v2_btree.pk): version 2 B-tree definitions
+- [`pickles/farray.pk`](pickles/farray.pk): fixed array chunk index definitions
+- [`pickles/earray.pk`](pickles/earray.pk): extensible array chunk index definitions
 - [`pickles/lookup3.pk`](pickles/lookup3.pk): implementation of the lookup3 hash function used for checksums
-- [`pickles/construct.pk`](pickles/construct.pk): helpers for constructing version 2 metadata in memory
 
 ## Acknowledgments
 
