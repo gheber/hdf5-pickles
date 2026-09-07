@@ -262,6 +262,54 @@ coverage_gaps:
     explored here -- this record establishes the primitive, not its worst-case
     exploitability.
 
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    H5VL_native_addr_to_token/token_to_addr write/read the file's own
+    declared address width (accepted up to 32 at open time) into/from a
+    fixed 16-byte H5O_token_t, with no bound check of their own
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range; present at 2.3.0
+    patched_versions: none
+  vulnerable_functions: >-
+    H5F_addr_encode_len and H5F_addr_decode_len (src/H5Fint.c:2946-2969 and
+    :3008-3054), called from H5VL_native_addr_to_token / _token_to_addr
+    (src/H5VLnative.c:430-455, :523-546). Public entry points include
+    H5Oget_info3, the H5Lget_info family, and any reference-token round trip;
+    reaching the overflow requires a file whose superblock declares
+    sizeof_addr = 32, a value the open-time gate accepts but the
+    file-creation API never produces on its own.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:H/PR:N/UI:R/S:U/C:N/I:N/A:L (base 4.3)"
+  cvss_rationale: >-
+    A stack buffer overflow (write direction) and out-of-bounds read
+    (decode direction) are both demonstrated with a working, fully
+    self-consistent width-32 specimen. AC:H reflects that no ordinary
+    application can produce such a file; it must be hand-constructed.
+    Impact is capped conservatively at Low availability because the most
+    common call site (H5Oget_info3) happens to self-mask the write's
+    visible effect (destination memset to zero immediately before and
+    after) on builds/compilers I tested -- whether a different call site or
+    stack layout escalates this further is an open question I flag rather
+    than claim.
+  weaknesses: >-
+    CWE-787 (out-of-bounds write, encode direction); CWE-125 (out-of-bounds
+    read, decode direction); CWE-1284 (the file's own declared width used,
+    unbounded, to size an operation against a fixed-size structure).
+  workarounds: >-
+    None identified beyond validating sizeof_addr before use. A validation
+    layer that refuses sizeof_addr outside {2,4,8} at superblock preflight
+    (the same gate an unrelated finding of mine already needed) closes this
+    for free, since both read the identical superblock byte.
+
 provenance:
   found_by: >-
     local analysis, triaging an externally-supplied report against this
@@ -270,7 +318,7 @@ provenance:
   h5policy_commit: "branch updates/20260903, at 954882254293"
   libhdf5_source: {branch: patch/20260903, commit: b5865e78549a, version: 2.3.0}
   baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: []}
-  asan_build: {prefix: "~/.local/hdf5-asan-ndebug", build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}
+  asan_build: {build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}  # workstation-local install; path not recorded
   input_note: >-
     wide32.h5 and its build script are not tracked -- see divergence.note.
     Left in the scratchpad this session produced them in; not portable

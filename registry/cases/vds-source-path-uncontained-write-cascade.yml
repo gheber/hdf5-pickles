@@ -151,6 +151,55 @@ coverage_gaps:
     fill values on an absent source, and nothing in the file's own metadata
     marks which mappings are expected to resolve.
 
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    A virtual dataset's absolute or parent-relative source path is opened
+    before any configured prefix/containment ever runs, and the resolved
+    source is opened with the VDS file's own inherited access intent, so an
+    ordinary H5Dwrite mutates an attacker-named external file in place
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range
+    patched_versions: >-
+      none identified; this reads as a deliberate design choice (the code
+      carries a comment pointing at the format's own reference manual)
+      rather than an oversight, so a fix is a policy decision rather than an
+      obvious patch
+  vulnerable_functions: >-
+    H5F_prefix_open_file (src/H5Fint.c:884-919, the absolute-path-first
+    ordering) and H5D__virtual_open_source_dset (src/H5Dvirtual.c:1407, the
+    inherited-intent open). Public entry points: H5Dread/H5Dwrite on a
+    virtual dataset whose source name is absolute or parent-relative.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:C/C:L/I:H/A:N (base 7.1)"
+  cvss_rationale: >-
+    Not memory corruption -- a design/containment gap. The write primitive
+    is real and measured (a decoy/control pair proves the prefix mechanism
+    is genuinely bypassed, not merely absent), but bounded: the resolver
+    opens rather than creates, so the target dataset must already exist
+    inside a file the process can open for writing. I:H reflects an
+    unauthenticated write to that target; C:L reflects that reading a VDS
+    dataset can also disclose whichever file actually resolves, which the
+    application does not control.
+  weaknesses: >-
+    CWE-668 (exposure of a resource to a wrong sphere -- the resolved file
+    is outside anything the application named); CWE-706 (use of
+    incorrectly-resolved name -- the prefix containment runs only as a
+    fallback, after the attacker's own name has already been tried).
+  workarounds: >-
+    Do not open, for writing, a file containing virtual datasets from an
+    untrusted source. There is no supported way to force VDS source
+    resolution to stay under a configured directory -- today's prefix is a
+    fallback, not a containment.
+
 provenance:
   found_by: >-
     local analysis, closing a gap both EFL bundles at the time flagged as open

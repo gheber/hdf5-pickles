@@ -90,7 +90,7 @@ measured:
     shape that reaches the vulnerable memcpy -- is already rejected, so this
     is a libhdf5-only finding with no h5policy gap to close.
   asan: >-
-    ~/.local/hdf5-asan-ndebug (RelWithDebInfo, ASan, -DNDEBUG retained so the
+    the candidate build (RelWithDebInfo, ASan, -DNDEBUG retained so the
     fast path's own asserts don't mask it -- see assert-shadows-asan-witness).
     `h5dump -d /d <file>`, BOTH variants: rc=134 (SIGABRT), identical trace:
       heap-buffer-overflow READ of size 4096 at 0x504000002475
@@ -102,7 +102,7 @@ measured:
     inflated value, read straight out of a 37-byte real chunk allocation from
     H5D__chunk_mem_alloc.)
   stock_release: >-
-    ~/.local (Release, non-ASan, h5dump 2.3.0). nelmts=1024: rc=1, clean
+    the baseline build (Release, non-ASan, h5dump 2.3.0). nelmts=1024: rc=1, clean
     "h5dump error: unable to print data" -- allocator luck, not a guard; the
     ASan trace above proves the same file is unsafe. nelmts=65536: rc=139,
     hard SIGSEGV. Matches the size-dependent split already on record in
@@ -237,6 +237,49 @@ coverage_gaps:
     n-bit (filter 5) not independently checked for this exact fast-path
     shape -- see sibling_audit.
 
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    The scale-offset filter's full-precision fast path memcpy's an
+    attacker-declared element count out of the chunk buffer with no check
+    against the buffer's real size, unlike its own bounds-checked slow-path
+    sibling fifteen lines below
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range; present at 2.3.0
+    patched_versions: none
+  vulnerable_functions: >-
+    H5Z__filter_scaleoffset (src/H5Zscaleoffset.c:1240-1248). Public entry
+    points: H5Dread on a chunked, scale-offset-filtered dataset whose chunk's
+    declared element count (cd_values[2]) exceeds its real element count
+    while the chunk's own minbits equals the full type width -- e.g. h5dump
+    -d, or any application that reads such a dataset.
+  severity: Medium
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:L/I:N/A:H (base 6.3)"
+  cvss_rationale: >-
+    A heap out-of-bounds READ is demonstrated and reliable (ASan) with a
+    hard crash on a plain, non-sanitized build at larger inflation values.
+    C:L reflects that the over-read lands in a buffer that becomes dataset
+    output, but a downstream size check in the pipeline refused the
+    oversized result on every build I tried -- I looked for and did not find
+    a disclosure primitive, so I am not claiming one.
+  weaknesses: >-
+    CWE-125 (the out-of-bounds read); CWE-20 (the root cause -- the fast
+    path never validates the declared element count against the buffer it
+    was actually handed, unlike its own slow-path sibling).
+  workarounds: >-
+    Validate a scale-offset filter's declared element count against the
+    dataset's real chunk element count before reading -- a local validation
+    layer of mine already does this independently and rejects every
+    specimen that could reach this memcpy, so the gap is libhdf5-only.
+
 provenance:
   found_by: >-
     local analysis, 2026-08-29 (original bundle, swept before promotion);
@@ -244,4 +287,4 @@ provenance:
   h5policy_commit: "branch updates/20260903, at 954882254293"
   libhdf5_source: {branch: patch/20260903, commit: b5865e78549a, version: 2.3.0}
   baseline_build: {version: 2.3.0, build_mode: RelWithDebInfo, sanitizers: []}
-  asan_build: {prefix: "~/.local/hdf5-asan-ndebug", build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}
+  asan_build: {build_mode: RelWithDebInfo, sanitizers: [address], ndebug: true}  # workstation-local install; path not recorded

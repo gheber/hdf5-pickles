@@ -509,3 +509,47 @@ provenance:
     heap-buffer-overflow WRITE of size 8 at H5Dvirtual.c:795.  Both are
     workstation-local installs; paths not recorded.
   poke_version: GNU poke 4.3
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    A virtual-dataset mapping count is multiplied into an allocation size
+    with no overflow check, and the failure-cleanup path then walks the same
+    unwrapped count over the wrapped buffer, reaching an untrusted-pointer
+    dereference rather than merely a free
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: ">= 1.10.0 (the decode-loop write); >= 2.0.0 (the cleanup half)"
+    patched_versions: none
+  vulnerable_functions: >-
+    H5D__virtual_load_layout (src/H5Dvirtual.c:704-725, the unchecked
+    narrow-and-multiply and the decode-loop write) and
+    H5D__virtual_free_layout_mappings (src/H5Dvirtual.c:1160-1195, the
+    failure-cleanup walk over the same unwrapped count). Public entry
+    points: H5Fopen/H5Dopen2 on a crafted VDS file.
+  severity: High
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:H (base 7.1)"
+  cvss_rationale: >-
+    A heap out-of-bounds WRITE is demonstrated and reliable (ASan, and a
+    baseline-build abort on a smaller wrap shape); a crafted count reaching
+    the failure-cleanup path escalates to an untrusted-pointer dereference
+    in the library's own error-recovery code, confirmed via ASan on both
+    64- and 32-bit builds (with different counts required per width, since
+    the two ABIs disagree on which counts even amplify). C:N because no
+    disclosure primitive was sought.
+  weaknesses: >-
+    CWE-190 (the unchecked integer overflow sizing the allocation);
+    CWE-822 (the untrusted pointer dereference in failure cleanup);
+    CWE-20 (no count/payload consistency check before either).
+  workarounds: >-
+    A local validation layer of mine already bounds the decoded mapping
+    count against the payload it must fit in and rejects it before any
+    allocation -- this is not part of upstream HDF5 and does not help any
+    other consumer.
