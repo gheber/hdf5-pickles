@@ -233,3 +233,90 @@ coverage_gaps:
     Whether any shipped tool does something worse than under-reporting -- for
     instance a repack that writes the truncated index back, making the loss
     permanent -- is unmeasured.
+  - >-
+    ATTRIBUTE-SIDE TRACE, seen 2026-09-07 in a locally-reviewed third-party
+    report (no advisory database consulted, nothing fetched or published --
+    n/a per repo policy).  `under_stated` above was traced only through the
+    LINK client (H5G__dense_build_table_cb / H5Gdense.c); the report walks the
+    same n-1 direction through the ATTRIBUTE client (client 8) end to end:
+    node_nrec > all_nrec drives H5A__dense_build_table_cb
+    (src/H5Aint.c:1616-1619) past its assert-only bound
+    (`assert(atable->num_attrs < atable->max_attrs)`) into an OOB WRITE on
+    atable->attrs, then H5A__attr_release_table (src/H5Aint.c:1954-1980) walks
+    the same corrupted count, reads past the allocation, and calls
+    H5A__close() on whatever pointer values are found there -- a wild-pointer
+    free with no link-side analogue, since dense links have no per-entry close
+    step at teardown. Confirms the mechanism generalizes to the attribute
+    client exactly as BT2_DENSE_NAME_CLIENTS = {5, 8} and the h5mutate recipes
+    already assume, and adds the teardown-free consequence as a second,
+    worse-than-the-link-side outcome.
+
+    RESOLVED (the write half) 2026-09-07: reproduced locally under the
+    candidate build (RelWithDebInfo, ASan, -DNDEBUG retained -- see
+    [[assert-shadows-asan-witness]]; workstation-local install, path not
+    recorded).  Seed
+    h5policy/tests/valid/dense_attribute.h5 (single BTHD, client 8) mutated
+    with the existing `bt2_total_nrec_minus_one` recipe -- no new recipe
+    needed, this is the same edit already assumed to cover client 8 --
+    giving all_nrec 30 -> 29 against a real tree of 30 (mutant sha256
+    ada80d68ba40d2858cf427f862230f1d2e50a1eb73ef1147f1bba4bb543b9748).
+    `h5dump -A` on the base file: rc=0, clean.  On the mutant: rc=134
+    (SIGABRT, ASan's abort_on_error), reporting
+    `heap-buffer-overflow WRITE of size 8` at H5Aint.c:1619 in
+    H5A__dense_build_table_cb, called from H5A__dense_iterate_bt2_cb
+    (H5Adense.c:1082) <- H5B2__iterate_node (H5B2int.c:1678/1684) --
+    matches the report's sink exactly.
+    STILL OPEN: the teardown half.  ASan aborts at the first violation (the
+    write), same limitation the report itself notes for its own PoC, so the
+    wild-pointer free in H5A__attr_release_table has not been independently
+    fired here either -- would need the write bound patched (or a
+    build that only warns) to let execution reach the release call with a
+    corrupted num_attrs.
+
+# -- Advisory shape ------------------------------------------------------------
+# Kept here rather than only in a working note; see the same field in
+# registry/cases/local-heap-free-list-bound-wraps.yml for why. NOT an
+# authorization to create, request an identifier for, or publish anything.
+advisory_draft:
+  title: >-
+    A v2 B-tree dense index's per-node and total record counts are never
+    cross-checked, and libhdf5 sizes a dependent-index table from one while
+    filling it by walking the other -- a one-off in either direction is a
+    memory-safety fault, on both the dense-link and dense-attribute forms
+  identifier: >-
+    Nothing found locally suggests this is already covered, but no advisory
+    database was consulted and none was looked up.
+  affected_products:
+    ecosystem: Other
+    package: HDF5 (the C library)
+    affected_versions: unverified as a range; present at 2.3.0
+    patched_versions: none
+  vulnerable_functions: >-
+    H5B2__cache_hdr_deserialize (src/H5B2cache.c:274-276, the unchecked
+    decode of node_nrec vs all_nrec); H5G__dense_build_table_cb
+    (src/H5Gdense.c:717) and H5A__dense_build_table_cb (src/H5Aint.c:1619),
+    both assert-only-guarded OOB writes; H5A__attr_release_table
+    (src/H5Aint.c:1954-1980), the wild-pointer free in teardown. Public
+    entry points: H5Aiterate2/H5Oget_info3-family calls, or a plain
+    h5dump -A / h5ls -r, on any dense-storage group or object.
+  severity: High
+  cvss: "CVSS:3.1/AV:L/AC:L/PR:N/UI:R/S:U/C:N/I:H/A:H (base 7.1)"
+  cvss_rationale: >-
+    A heap out-of-bounds WRITE is demonstrated and reliable on both the
+    dense-attribute (ASan-confirmed) and dense-link (stock-crash-confirmed)
+    forms, from an ordinary API call. I:H/A:H reflect the write primitive
+    directly; C:N because no disclosure primitive was sought or found. The
+    teardown wild-pointer free is established by source reading and
+    confirmed on the dense-link sibling, but ASan halts at the first
+    violation on my own dense-attribute specimen, so I have not
+    independently fired it there.
+  weaknesses: >-
+    CWE-787 (the out-of-bounds write, both storage forms); CWE-825 (the
+    wild-pointer free during teardown, confirmed on the dense-link form);
+    CWE-20 (the root cause -- the two record-count fields are never
+    compared against each other at decode time).
+  workarounds: >-
+    A local validation layer of mine already cross-checks the walked record
+    total against the header's stored total for both the dense-link and
+    dense-attribute name-index walkers, and rejects the mismatch -- this is
+    not part of upstream HDF5 and does not help any other consumer.
